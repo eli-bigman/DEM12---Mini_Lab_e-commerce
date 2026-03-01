@@ -1,0 +1,5 @@
+apache-airflow-providers-amazon==8.23.0
+minio==7.2.7
+great-expectations==0.18.19
+psycopg2-binary==2.9.9
+pandas==2.2.2
