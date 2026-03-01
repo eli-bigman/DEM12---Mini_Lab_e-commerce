@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# Airflow
+airflow/logs/
+airflow/plugins/
+
+# Metabase
+metabase-data/
+
+# MinIO data
+minio/data/
+
+# Postgres data
+postgres/data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Distribution
+*.tar.gz
+*.zip
+
+# markdown files
+*.md
+!README.md
