@@ -1,0 +1,265 @@
+services:
+
+  # ============================================================
+  # Collector Service: Generates and uploads raw e-commerce data
+  # ============================================================
+  collector:
+    build:
+      context: ./collector
+      dockerfile: Dockerfile
+    container_name: ecommerce_collector
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET}
+      COLLECTOR_BATCH_INTERVAL_SECONDS: ${COLLECTOR_BATCH_INTERVAL_SECONDS:-60}
+      COLLECTOR_BATCH_SIZE: ${COLLECTOR_BATCH_SIZE:-50}
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - platform_net
+
+  # ============================================================
+  # MinIO: Object storage (data lake layer)
+  # ============================================================
+  minio:
+    image: minio/minio:latest
+    container_name: ecommerce_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO Console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - platform_net
+
+  # ============================================================
+  # MinIO Init: Creates required buckets on first launch
+  # ============================================================
+  minio-init:
+    image: minio/mc:latest
+    container_name: ecommerce_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file:
+      - .env
+    entrypoint: >
+      /bin/sh -c " mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} && mc mb --ignore-existing local/$${MINIO_RAW_BUCKET} && mc mb --ignore-existing local/quarantine && echo 'MinIO buckets initialized successfully.' && exit 0 "
+    networks:
+      - platform_net
+
+  # ============================================================
+  # PostgreSQL: Structured relational storage (analytics layer)
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: ecommerce_postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - platform_net
+
+  # ============================================================
+  # Airflow Init: Initializes DB, creates admin user
+  # ============================================================
+  airflow-init:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: ecommerce_airflow_init
+    command:
+      - bash
+      - -c
+      - >-
+        airflow db migrate && airflow users create --username "$${AIRFLOW_ADMIN_USERNAME}" --password "$${AIRFLOW_ADMIN_PASSWORD}" --firstname Admin --lastname User --role Admin --email "$${AIRFLOW_ADMIN_EMAIL}" || true
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - platform_net
+
+  # ============================================================
+  # Airflow Webserver: UI for monitoring and managing DAGs
+  # ============================================================
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: ecommerce_airflow_webserver
+    restart: unless-stopped
+    command: webserver
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - airflow_plugins:/opt/airflow/plugins
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:8080/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - platform_net
+
+  # ============================================================
+  # Airflow Scheduler: Triggers and schedules DAG runs
+  # ============================================================
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: ecommerce_airflow_scheduler
+    restart: unless-stopped
+    command: scheduler
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - airflow_plugins:/opt/airflow/plugins
+    healthcheck:
+      test: [ "CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$(hostname)" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - platform_net
+
+  # ============================================================
+  # Metabase: Business Intelligence and dashboarding layer
+  # ============================================================
+  metabase:
+    image: metabase/metabase:latest
+    container_name: ecommerce_metabase
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MB_DB_TYPE: ${MB_DB_TYPE}
+      MB_DB_DBNAME: ${MB_DB_DBNAME}
+      MB_DB_PORT: ${MB_DB_PORT}
+      MB_DB_USER: ${MB_DB_USER}
+      MB_DB_PASS: ${MB_DB_PASS}
+      MB_DB_HOST: ${MB_DB_HOST}
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:3000/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - platform_net
+
+# ============================================================
+# Named Volumes
+# ============================================================
+volumes:
+  minio_data:
+  postgres_data:
+  airflow_logs:
+  airflow_plugins:
+
+    # ============================================================
+    # Networks
+    # ============================================================
+networks:
+  platform_net:
+    driver: bridge
