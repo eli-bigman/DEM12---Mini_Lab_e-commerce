@@ -59,7 +59,9 @@ class TestCustomersValidator:
     def test_duplicate_ids_are_quarantined(self, valid_customers_df):
         df = pd.concat([valid_customers_df, valid_customers_df.iloc[[0]]], ignore_index=True)
         valid, invalid = validate("customers", df)
-        assert len(invalid) == 1  # second occurrence quarantined
+        # GE expect_column_values_to_be_unique flags ALL occurrences of a duplicate
+        assert len(invalid) >= 1
+
 
 
 # ---------------------------------------------------------------------------

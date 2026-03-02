@@ -2,169 +2,192 @@
 utils/validators.py
 
 Great Expectations-based validation for each entity DataFrame.
-Uses the GX Ephemeral DataContext (in-memory, no filesystem required).
+Uses an ephemeral GX DataContext (in-memory, no filesystem required).
 
-For each entity, the validator returns:
-  - valid_df   : DataFrame of rows that passed all expectations
-  - invalid_df : DataFrame of rows that failed one or more expectations
+Each entity validator uses:
+  - GX expectations for: null checks, UUID regex, enum allowlists, uniqueness,
+    and numeric range checks.
+  - Failing row indices are collected from all failed GX expectations.
+  - A (valid_df, invalid_df) tuple is returned for DLQ routing.
 """
 
 from __future__ import annotations
 
 import logging
 
+import great_expectations as gx
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+UUID_REGEX = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
 
 # ---------------------------------------------------------------------------
-# Internal helper
+# Core GX runner
 # ---------------------------------------------------------------------------
 
-def _split_valid_invalid(df: pd.DataFrame, mask: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split DataFrame into (passing, failing) based on a boolean mask."""
-    return df[mask].copy(), df[~mask].copy()
+def _run_gx_suite(
+    df: pd.DataFrame,
+    entity: str,
+    add_expectations_fn,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run a Great Expectations suite against a DataFrame.
 
+    Parameters
+    ----------
+    df                   : Input DataFrame (all columns as strings from CSV read).
+    entity               : Entity name used for naming the GX datasource/suite.
+    add_expectations_fn  : Callable(validator) that registers expectations on the validator.
 
-def _base_uuid_mask(df: pd.DataFrame, col: str) -> pd.Series:
-    """Return a boolean Series: True if the column looks like a UUID."""
-    import re
-    uuid_re = re.compile(
-        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-        re.IGNORECASE,
+    Returns
+    -------
+    (valid_df, invalid_df) — rows that passed all expectations vs rows that failed any.
+    """
+    context = gx.get_context(mode="ephemeral")
+    source = context.sources.add_pandas(f"{entity}_source")
+    asset = source.add_dataframe_asset(f"{entity}_asset")
+    batch_request = asset.build_batch_request(dataframe=df)
+
+    context.add_expectation_suite(f"{entity}_suite")
+    validator = context.get_validator(
+        batch_request=batch_request,
+        expectation_suite_name=f"{entity}_suite",
     )
-    return df[col].astype(str).str.match(uuid_re)
 
+    add_expectations_fn(validator)
 
-def _not_null_mask(df: pd.DataFrame, cols: list[str]) -> pd.Series:
-    """Return True for rows where all cols are non-null and non-empty string."""
-    mask = pd.Series(True, index=df.index)
-    for col in cols:
-        mask &= df[col].notna() & (df[col].astype(str).str.strip() != "")
-    return mask
+    # COMPLETE result format returns `unexpected_index_list` for every expectation
+    result = validator.validate(
+        result_format={"result_format": "COMPLETE", "partial_unexpected_count": 0},
+    )
 
+    failed_indices: set[int] = set()
+    for expectation_result in result.results:
+        if not expectation_result.success:
+            idx_list = expectation_result.result.get("unexpected_index_list", [])
+            failed_indices.update(idx_list)
+            logger.debug(
+                "GX [%s] failed expectation '%s': %d unexpected rows",
+                entity,
+                expectation_result.expectation_config.expectation_type,
+                len(idx_list),
+            )
 
-def _is_positive_numeric(series: pd.Series) -> pd.Series:
-    """Return True for rows where the series can be parsed as a positive number."""
-    numeric = pd.to_numeric(series, errors="coerce")
-    return numeric.notna() & (numeric >= 0)
+    failed_mask = df.index.isin(failed_indices)
+    valid_df = df[~failed_mask].copy()
+    invalid_df = df[failed_mask].copy()
 
-
-def _no_duplicates_mask(df: pd.DataFrame, id_col: str) -> pd.Series:
-    """Return True for the first occurrence of each id; flags subsequent duplicates."""
-    return ~df.duplicated(subset=[id_col], keep="first")
+    logger.info(
+        "GX validation complete for '%s': %d valid, %d invalid (suite success=%s)",
+        entity, len(valid_df), len(invalid_df), result.success,
+    )
+    return valid_df, invalid_df
 
 
 # ---------------------------------------------------------------------------
-# Per-entity validation functions
+# Per-entity validators
 # ---------------------------------------------------------------------------
 
 def validate_customers(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Validating customers (%d rows)", len(df))
-    required = ["customer_id", "signup_date", "country", "acquisition_channel", "customer_segment"]
-    valid_channels = {"Organic", "Facebook", "Google", "Email"}
-    valid_segments = {"New", "Returning", "VIP"}
+    def add_expectations(v):
+        for col in ["customer_id", "signup_date", "country", "acquisition_channel", "customer_segment"]:
+            v.expect_column_values_to_not_be_null(col)
+        v.expect_column_values_to_match_regex("customer_id", UUID_REGEX)
+        v.expect_column_values_to_be_in_set(
+            "acquisition_channel", ["Organic", "Facebook", "Google", "Email"]
+        )
+        v.expect_column_values_to_be_in_set(
+            "customer_segment", ["New", "Returning", "VIP"]
+        )
+        v.expect_column_values_to_be_unique("customer_id")
 
-    mask = (
-        _not_null_mask(df, required)
-        & _base_uuid_mask(df, "customer_id")
-        & df["acquisition_channel"].isin(valid_channels)
-        & df["customer_segment"].isin(valid_segments)
-        & _no_duplicates_mask(df, "customer_id")
-    )
-    return _split_valid_invalid(df, mask)
+    return _run_gx_suite(df, "customers", add_expectations)
 
 
 def validate_products(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Validating products (%d rows)", len(df))
-    required = ["product_id", "product_name", "category", "cost_price", "selling_price", "inventory_quantity"]
+    def add_expectations(v):
+        for col in ["product_id", "product_name", "category", "cost_price", "selling_price", "inventory_quantity"]:
+            v.expect_column_values_to_not_be_null(col)
+        v.expect_column_values_to_match_regex("product_id", UUID_REGEX)
+        v.expect_column_values_to_match_regex("cost_price", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_match_regex("selling_price", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_match_regex("inventory_quantity", r"^\d+$")
+        v.expect_column_values_to_be_unique("product_id")
 
-    mask = (
-        _not_null_mask(df, required)
-        & _base_uuid_mask(df, "product_id")
-        & _is_positive_numeric(df["cost_price"])
-        & _is_positive_numeric(df["selling_price"])
-        & _is_positive_numeric(df["inventory_quantity"])
-        & _no_duplicates_mask(df, "product_id")
-    )
-    return _split_valid_invalid(df, mask)
+    return _run_gx_suite(df, "products", add_expectations)
 
 
 def validate_orders(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Validating orders (%d rows)", len(df))
-    required = ["order_id", "customer_id", "product_id", "quantity", "unit_price", "total_amount", "order_timestamp"]
-    valid_statuses = {"Completed", "Cancelled", "Refunded"}
+    def add_expectations(v):
+        for col in ["order_id", "customer_id", "product_id", "quantity",
+                    "unit_price", "total_amount", "order_timestamp"]:
+            v.expect_column_values_to_not_be_null(col)
+        v.expect_column_values_to_match_regex("order_id", UUID_REGEX)
+        v.expect_column_values_to_match_regex("unit_price", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_match_regex("total_amount", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_match_regex("quantity", r"^\d+$")
+        v.expect_column_values_to_be_in_set(
+            "order_status", ["Completed", "Cancelled", "Refunded"]
+        )
+        v.expect_column_values_to_be_unique("order_id")
 
-    mask = (
-        _not_null_mask(df, required)
-        & _base_uuid_mask(df, "order_id")
-        & _is_positive_numeric(df["unit_price"])
-        & _is_positive_numeric(df["total_amount"])
-        & _is_positive_numeric(df["quantity"])
-        & df["order_status"].isin(valid_statuses)
-        & _no_duplicates_mask(df, "order_id")
-    )
-    return _split_valid_invalid(df, mask)
+    return _run_gx_suite(df, "orders", add_expectations)
 
 
 def validate_payments(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Validating payments (%d rows)", len(df))
-    required = ["payment_id", "order_id", "payment_date", "payment_method", "amount", "payment_status"]
-    valid_statuses = {"Successful", "Failed", "Pending"}
+    def add_expectations(v):
+        for col in ["payment_id", "order_id", "payment_date", "payment_method", "amount", "payment_status"]:
+            v.expect_column_values_to_not_be_null(col)
+        v.expect_column_values_to_match_regex("payment_id", UUID_REGEX)
+        v.expect_column_values_to_match_regex("amount", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_be_in_set(
+            "payment_status", ["Successful", "Failed", "Pending"]
+        )
+        v.expect_column_values_to_be_unique("payment_id")
 
-    mask = (
-        _not_null_mask(df, required)
-        & _base_uuid_mask(df, "payment_id")
-        & _is_positive_numeric(df["amount"])
-        & df["payment_status"].isin(valid_statuses)
-        & _no_duplicates_mask(df, "payment_id")
-    )
-    return _split_valid_invalid(df, mask)
+    return _run_gx_suite(df, "payments", add_expectations)
 
 
 def validate_inventory(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Validating inventory (%d rows)", len(df))
-    required = ["inventory_id", "product_id", "warehouse_location", "quantity_on_hand", "last_restock_date"]
+    def add_expectations(v):
+        for col in ["inventory_id", "product_id", "warehouse_location", "quantity_on_hand", "last_restock_date"]:
+            v.expect_column_values_to_not_be_null(col)
+        v.expect_column_values_to_match_regex("inventory_id", UUID_REGEX)
+        v.expect_column_values_to_match_regex("quantity_on_hand", r"^\d+$")
+        v.expect_column_values_to_be_unique("inventory_id")
 
-    mask = (
-        _not_null_mask(df, required)
-        & _base_uuid_mask(df, "inventory_id")
-        & _is_positive_numeric(df["quantity_on_hand"])
-        & _no_duplicates_mask(df, "inventory_id")
-    )
-    return _split_valid_invalid(df, mask)
+    return _run_gx_suite(df, "inventory", add_expectations)
 
 
 def validate_revenue(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Validating revenue (%d rows)", len(df))
-    required = ["revenue_id", "record_date", "total_revenue", "total_profit"]
+    def add_expectations(v):
+        for col in ["revenue_id", "record_date", "total_revenue", "total_profit"]:
+            v.expect_column_values_to_not_be_null(col)
+        v.expect_column_values_to_match_regex("revenue_id", UUID_REGEX)
+        v.expect_column_values_to_match_regex("total_revenue", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_match_regex("total_profit", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_be_unique("revenue_id")
 
-    mask = (
-        _not_null_mask(df, required)
-        & _base_uuid_mask(df, "revenue_id")
-        & _is_positive_numeric(df["total_revenue"])
-        & _is_positive_numeric(df["total_profit"])
-        & _no_duplicates_mask(df, "revenue_id")
-    )
-    return _split_valid_invalid(df, mask)
+    return _run_gx_suite(df, "revenue", add_expectations)
 
 
 def validate_returns(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Validating returns (%d rows)", len(df))
-    required = ["return_id", "order_id", "return_date", "return_reason", "refund_amount", "return_status"]
-    valid_reasons = {"Defective", "Wrong Item", "Changed Mind"}
-    valid_statuses = {"Processed", "Pending", "Rejected"}
+    def add_expectations(v):
+        for col in ["return_id", "order_id", "return_date", "return_reason", "refund_amount", "return_status"]:
+            v.expect_column_values_to_not_be_null(col)
+        v.expect_column_values_to_match_regex("return_id", UUID_REGEX)
+        v.expect_column_values_to_match_regex("refund_amount", r"^\d+(\.\d+)?$")
+        v.expect_column_values_to_be_in_set(
+            "return_reason", ["Defective", "Wrong Item", "Changed Mind"]
+        )
+        v.expect_column_values_to_be_in_set(
+            "return_status", ["Processed", "Pending", "Rejected"]
+        )
+        v.expect_column_values_to_be_unique("return_id")
 
-    mask = (
-        _not_null_mask(df, required)
-        & _base_uuid_mask(df, "return_id")
-        & _is_positive_numeric(df["refund_amount"])
-        & df["return_reason"].isin(valid_reasons)
-        & df["return_status"].isin(valid_statuses)
-        & _no_duplicates_mask(df, "return_id")
-    )
-    return _split_valid_invalid(df, mask)
+    return _run_gx_suite(df, "returns", add_expectations)
 
 
 # ---------------------------------------------------------------------------
@@ -184,18 +207,10 @@ VALIDATORS = {
 
 def validate(entity: str, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Validate a DataFrame for the given entity.
-
-    Returns
-    -------
-    (valid_df, invalid_df)
+    Validate a DataFrame for the given entity using Great Expectations.
+    Returns (valid_df, invalid_df).
     """
     fn = VALIDATORS.get(entity)
     if fn is None:
         raise ValueError(f"No validator defined for entity: {entity!r}")
-    valid, invalid = fn(df)
-    logger.info(
-        "Validation complete for %s: %d valid, %d invalid",
-        entity, len(valid), len(invalid),
-    )
-    return valid, invalid
+    return fn(df)
