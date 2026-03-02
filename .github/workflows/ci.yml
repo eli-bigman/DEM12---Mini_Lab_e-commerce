@@ -152,7 +152,7 @@ jobs:
           echo "Polling DAG run status..."
           FINAL_STATUS="unknown"
           for i in $(seq 1 30); do
-            sleep 15
+            sleep 60
             FINAL_STATUS=$(docker exec ecommerce_airflow_webserver \
               airflow dags list-runs -d ecommerce_pipeline \
               --no-backfill -o json 2>/dev/null \
