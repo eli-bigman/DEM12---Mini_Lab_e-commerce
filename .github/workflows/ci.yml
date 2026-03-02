@@ -111,11 +111,33 @@ jobs:
             sleep 10
           done
 
-      - name: Verify database connection and analytics tables
+      - name: Verify database connection and analytics schema
         run: |
+          echo "Waiting for Postgres to be ready..."
           docker exec ecommerce_postgres pg_isready -U ecommerce_user -d ecommerce
-          docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
-            -c "SELECT COUNT(*) AS dim_date_rows FROM analytics.dim_date;"
+
+          echo "Polling for analytics.dim_date to be populated by init scripts..."
+          for i in $(seq 1 30); do
+            ROW_COUNT=$(docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce -t -q \
+              -c "SELECT COUNT(*) FROM information_schema.tables \
+                  WHERE table_schema = 'analytics' AND table_name = 'dim_date';" \
+              2>/dev/null | tr -d ' \n' || echo "0")
+            if [ "$ROW_COUNT" = "1" ]; then
+              echo "analytics.dim_date exists. Verifying row count..."
+              docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
+                -c "SELECT COUNT(*) AS dim_date_rows FROM analytics.dim_date;"
+              echo "Database schema verified successfully."
+              break
+            fi
+            echo "analytics.dim_date not ready yet (attempt $i/30). Retrying in 5s..."
+            sleep 5
+            if [ "$i" = "30" ]; then
+              echo "ERROR: analytics.dim_date was never created. Init script may have failed."
+              docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
+                -c "\dn+" || true
+              exit 1
+            fi
+          done
 
       - name: Wait for Collector to successfully upload data to MinIO
         run: |
