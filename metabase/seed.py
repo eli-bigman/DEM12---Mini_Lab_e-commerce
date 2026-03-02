@@ -14,12 +14,12 @@ What this script does:
 Usage:
   python seed.py
 
-Environment variables (read from .env or set in shell):
-  METABASE_URL            e.g. http://localhost:3000
-  METABASE_ADMIN_EMAIL    e.g. admin@example.com
-  METABASE_ADMIN_PASSWORD e.g. admin123
-  POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB,
-  POSTGRES_USER, POSTGRES_PASSWORD
+Required environment variables:
+  METABASE_URL              e.g. http://localhost:3000
+  METABASE_ADMIN_EMAIL      e.g. admin@example.com
+  METABASE_ADMIN_PASSWORD   Must be a strong password (Metabase rejects common ones)
+  POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB
+  MB_DB_PASS                Password for the metabase_user Postgres role
 """
 
 import os
@@ -32,14 +32,14 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("metabase_seed")
 
-BASE_URL          = os.environ.get("METABASE_URL", "http://localhost:3000")
-ADMIN_EMAIL       = os.environ.get("METABASE_ADMIN_EMAIL", "admin@example.com")
-ADMIN_PASSWORD    = os.environ.get("METABASE_ADMIN_PASSWORD", "admin123")
-PG_HOST           = os.environ.get("POSTGRES_HOST", "postgres")
-PG_PORT           = int(os.environ.get("POSTGRES_PORT", "5432"))
-PG_DB             = os.environ.get("POSTGRES_DB", "ecommerce")
-PG_USER           = os.environ.get("POSTGRES_USER", "metabase_user")
-PG_PASS           = os.environ.get("MB_DB_PASS", "metabase_secret_password")
+BASE_URL       = os.environ.get("METABASE_URL", "http://localhost:3000")
+ADMIN_EMAIL    = os.environ["METABASE_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["METABASE_ADMIN_PASSWORD"]
+PG_HOST        = os.environ.get("POSTGRES_HOST", "postgres")
+PG_PORT        = int(os.environ.get("POSTGRES_PORT", "5432"))
+PG_DB          = os.environ.get("POSTGRES_DB", "ecommerce")
+PG_USER        = os.environ.get("POSTGRES_USER", "metabase_user")
+PG_PASS        = os.environ["MB_DB_PASS"]
 
 
 # ---------------------------------------------------------------------------
@@ -62,20 +62,24 @@ def wait_for_metabase(timeout: int = 180) -> None:
     raise TimeoutError("Metabase did not become ready within the timeout period.")
 
 
-def needs_setup() -> bool:
-    """Return True if Metabase has not been set up yet."""
-    r = requests.get(f"{BASE_URL}/api/session/properties")
-    return r.json().get("setup-token") is not None
-
-
 def setup_metabase() -> str:
-    """Complete the initial Metabase setup. Returns a session token."""
+    """
+    Complete the initial Metabase setup OR log in if already set up.
+
+    Handles three scenarios:
+      1. Fresh Metabase (setup-token present, no user) -> run /api/setup
+      2. Setup token present but user exists (partial setup) -> fall back to login
+      3. No setup token (fully configured) -> login directly
+    Returns a session token.
+    """
     props = requests.get(f"{BASE_URL}/api/session/properties").json()
     token = props.get("setup-token")
+
     if not token:
         log.info("Metabase is already set up. Logging in.")
         return login()
 
+    # Attempt initial setup
     log.info("Running initial Metabase setup ...")
     payload = {
         "token": token,
@@ -89,9 +93,14 @@ def setup_metabase() -> str:
         "prefs": {"site_name": "E-Commerce Platform", "allow_tracking": False},
     }
     r = requests.post(f"{BASE_URL}/api/setup", json=payload)
-    r.raise_for_status()
-    log.info("Metabase setup complete.")
-    return r.json()["id"]
+
+    if r.ok:
+        log.info("Metabase setup complete.")
+        return r.json()["id"]
+
+    # Setup failed (user already exists, password rejected, etc.) -- fall back to login
+    log.warning("Setup endpoint returned %d: %s. Falling back to login.", r.status_code, r.text)
+    return login()
 
 
 def login() -> str:
@@ -111,6 +120,8 @@ def api(method: str, path: str, token: str, **kwargs) -> dict:
         headers={"X-Metabase-Session": token},
         **kwargs,
     )
+    if not r.ok:
+        log.error("API error %s %s (%d): %s", method.upper(), path, r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 
@@ -264,12 +275,14 @@ def create_dashboard(token: str, card_ids: list[int]) -> int:
     dash_id = dash["id"]
 
     # Add cards to dashboard in a 2-column grid layout
+    # Use snake_case field names (card_id) for Metabase API compatibility
     cards_payload = []
     for i, card_id in enumerate(card_ids):
         col = (i % 2) * 12       # 0 or 12  (two columns of width 12)
         row = (i // 2) * 8       # stack rows of height 8
         cards_payload.append({
-            "cardId": card_id,
+            "id": -(i + 1),       # temporary negative ID for new dashcards
+            "card_id": card_id,
             "col": col,
             "row": row,
             "size_x": 12,

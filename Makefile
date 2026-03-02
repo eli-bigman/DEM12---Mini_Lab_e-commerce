@@ -141,18 +141,8 @@ dag-logs:
 # ============================================================
 
 seed-metabase:
-	@echo "Seeding Metabase dashboards ..."
-	cd metabase && \
-		pip install -q -r requirements.txt && \
-		METABASE_URL=http://localhost:3000 \
-		METABASE_ADMIN_EMAIL=$$(grep METABASE_ADMIN_EMAIL ../.env | cut -d= -f2) \
-		METABASE_ADMIN_PASSWORD=$$(grep METABASE_ADMIN_PASSWORD ../.env | cut -d= -f2) \
-		POSTGRES_HOST=localhost \
-		POSTGRES_PORT=$$(grep POSTGRES_PORT ../.env | cut -d= -f2) \
-		POSTGRES_DB=$$(grep POSTGRES_DB ../.env | cut -d= -f2) \
-		POSTGRES_USER=metabase_user \
-		MB_DB_PASS=$$(grep MB_DB_PASS ../.env | cut -d= -f2) \
-		python seed.py
+	@echo "Seeding Metabase dashboards via Docker ..."
+	docker compose run --rm seed-metabase
 
 # ============================================================
 # Testing
