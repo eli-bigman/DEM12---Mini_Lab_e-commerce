@@ -1,0 +1,111 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ------------------------------------------------------------
+  # Job 1: Unit and integration tests
+  # ------------------------------------------------------------
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Install Airflow (for DAG integrity tests)
+        run: |
+          pip install apache-airflow==2.9.3 \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt"
+
+      - name: Run pytest (validators and cleaners)
+        run: pytest tests/test_validators.py tests/test_cleaners.py -v --tb=short
+
+  # ------------------------------------------------------------
+  # Job 2: Docker image build validation
+  # ------------------------------------------------------------
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create .env from example
+        run: cp .env.example .env
+
+      - name: Build all Docker images
+        run: docker compose build
+
+  # ------------------------------------------------------------
+  # Job 3: Stack validation (end-to-end smoke test)
+  # ------------------------------------------------------------
+  validate:
+    name: Validate Stack
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create .env from example
+        run: cp .env.example .env
+
+      - name: Start the full stack
+        run: docker compose up -d --build
+
+      - name: Wait for all services to be healthy
+        run: |
+          echo "Waiting for services..."
+          sleep 90
+
+      - name: Verify database connection
+        run: |
+          docker exec ecommerce_postgres pg_isready \
+            -U ecommerce_user -d ecommerce
+
+      - name: Verify all analytics tables exist
+        run: |
+          docker exec ecommerce_postgres psql \
+            -U ecommerce_user -d ecommerce \
+            -c "SELECT COUNT(*) FROM analytics.dim_date;" \
+            -c "SELECT COUNT(*) FROM analytics.fact_orders;" \
+            -c "SELECT COUNT(*) FROM staging.processed_files;"
+
+      - name: Trigger the ecommerce pipeline DAG
+        run: |
+          docker exec ecommerce_airflow_webserver \
+            airflow dags trigger ecommerce_pipeline
+
+      - name: Wait for pipeline to process initial data
+        run: sleep 120
+
+      - name: Confirm fact_orders has rows
+        run: |
+          ROW_COUNT=$(docker exec ecommerce_postgres psql \
+            -U ecommerce_user -d ecommerce -t \
+            -c "SELECT COUNT(*) FROM analytics.fact_orders;" | tr -d ' ')
+          echo "fact_orders rows: $ROW_COUNT"
+          if [ "$ROW_COUNT" -eq "0" ]; then
+            echo "FAIL: fact_orders is empty after pipeline run"
+            exit 1
+          fi
+          echo "PASS: fact_orders has $ROW_COUNT rows"
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v
