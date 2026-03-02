@@ -201,7 +201,7 @@ def transform_fact_orders() -> int:
             ON dc.customer_id = o.customer_id::UUID AND dc.is_current = TRUE
         LEFT JOIN analytics.dim_products dp
             ON dp.product_id = o.product_id::UUID AND dp.is_current = TRUE
-        ON CONFLICT (order_id) DO UPDATE SET
+        ON CONFLICT (order_id, order_timestamp) DO UPDATE SET
             order_status = EXCLUDED.order_status,
             revenue      = EXCLUDED.revenue,
             profit       = EXCLUDED.profit
