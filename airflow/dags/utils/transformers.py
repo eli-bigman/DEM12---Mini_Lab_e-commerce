@@ -10,6 +10,10 @@ Design principles:
   - CDC-aware: fact_orders handles late-arriving order_status updates by
     upserting the current state.
   - dim_inventory uses a simple UPSERT (snapshot, no history).
+  - Bootstrap: ensure_analytics_schema() idempotently creates the analytics
+    schema and all tables before any transform runs, so the pipeline works
+    even when the Postgres volume already existed (init scripts only run on
+    first container boot).
 """
 
 from __future__ import annotations
@@ -19,6 +23,223 @@ import logging
 from .db_helper import transaction
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Schema bootstrap  (idempotent DDL - safe to run every pipeline run)
+# ---------------------------------------------------------------------------
+
+def ensure_analytics_schema() -> None:
+    """
+    Idempotently create the analytics schema and all its tables.
+
+    This is a safety net for environments where the Postgres data volume
+    already existed before the init scripts were added (or when the container
+    was restarted without recreating the volume).
+    PostgreSQL's docker-entrypoint-initdb.d only runs on first boot.
+    """
+    ddl = """
+        -- Schema
+        CREATE SCHEMA IF NOT EXISTS analytics;
+
+        -- dim_date
+        CREATE TABLE IF NOT EXISTS analytics.dim_date (
+            date_key      INTEGER PRIMARY KEY,
+            full_date     DATE NOT NULL UNIQUE,
+            day_of_week   SMALLINT NOT NULL,
+            day_name      TEXT NOT NULL,
+            day_of_month  SMALLINT NOT NULL,
+            day_of_year   SMALLINT NOT NULL,
+            week_of_year  SMALLINT NOT NULL,
+            month_number  SMALLINT NOT NULL,
+            month_name    TEXT NOT NULL,
+            quarter       SMALLINT NOT NULL,
+            year          SMALLINT NOT NULL,
+            is_weekend    BOOLEAN NOT NULL
+        );
+
+        -- dim_customers (SCD2)
+        CREATE TABLE IF NOT EXISTS analytics.dim_customers (
+            customer_sk        BIGSERIAL PRIMARY KEY,
+            customer_id        UUID NOT NULL,
+            signup_date        DATE,
+            country            TEXT,
+            acquisition_channel TEXT,
+            customer_segment   TEXT,
+            valid_from         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to           TIMESTAMPTZ,
+            is_current         BOOLEAN NOT NULL DEFAULT TRUE
+        );
+        CREATE INDEX IF NOT EXISTS idx_dim_cust_nk
+            ON analytics.dim_customers(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_dim_cust_current
+            ON analytics.dim_customers(customer_id, is_current);
+
+        -- dim_products (SCD2)
+        CREATE TABLE IF NOT EXISTS analytics.dim_products (
+            product_sk    BIGSERIAL PRIMARY KEY,
+            product_id    UUID NOT NULL,
+            product_name  TEXT,
+            category      TEXT,
+            cost_price    NUMERIC(12, 2),
+            selling_price NUMERIC(12, 2),
+            valid_from    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to      TIMESTAMPTZ,
+            is_current    BOOLEAN NOT NULL DEFAULT TRUE
+        );
+        CREATE INDEX IF NOT EXISTS idx_dim_prod_nk
+            ON analytics.dim_products(product_id);
+        CREATE INDEX IF NOT EXISTS idx_dim_prod_current
+            ON analytics.dim_products(product_id, is_current);
+
+        -- dim_inventory (snapshot)
+        CREATE TABLE IF NOT EXISTS analytics.dim_inventory (
+            inventory_sk      BIGSERIAL PRIMARY KEY,
+            inventory_id      UUID NOT NULL UNIQUE,
+            product_id        UUID NOT NULL,
+            warehouse_location TEXT,
+            quantity_on_hand   INTEGER,
+            last_restock_date  DATE,
+            updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_dim_inv_product
+            ON analytics.dim_inventory(product_id);
+
+        -- fact_payments
+        CREATE TABLE IF NOT EXISTS analytics.fact_payments (
+            payment_id     UUID PRIMARY KEY,
+            order_id       UUID NOT NULL,
+            date_key       INTEGER,
+            payment_date   TIMESTAMPTZ,
+            payment_method TEXT,
+            amount         NUMERIC(12, 2),
+            payment_status TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fp_order
+            ON analytics.fact_payments(order_id);
+        CREATE INDEX IF NOT EXISTS idx_fp_date
+            ON analytics.fact_payments(date_key);
+
+        -- fact_returns
+        CREATE TABLE IF NOT EXISTS analytics.fact_returns (
+            return_id     UUID PRIMARY KEY,
+            order_id      UUID NOT NULL,
+            date_key      INTEGER,
+            return_date   TIMESTAMPTZ,
+            refund_amount NUMERIC(12, 2),
+            return_reason TEXT,
+            return_status TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fr_order
+            ON analytics.fact_returns(order_id);
+        CREATE INDEX IF NOT EXISTS idx_fr_date
+            ON analytics.fact_returns(date_key);
+
+        -- agg_revenue
+        CREATE TABLE IF NOT EXISTS analytics.agg_revenue (
+            record_date   DATE PRIMARY KEY,
+            total_revenue NUMERIC(15, 2) NOT NULL DEFAULT 0,
+            total_profit  NUMERIC(15, 2) NOT NULL DEFAULT 0,
+            total_orders  INTEGER NOT NULL DEFAULT 0,
+            updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """
+
+    # fact_orders is partitioned — must be created separately so we can also
+    # create its child partitions.  We do NOT try to recreate existing ones.
+    fact_orders_ddl = """
+        CREATE TABLE IF NOT EXISTS analytics.fact_orders (
+            order_id        UUID NOT NULL,
+            customer_sk     BIGINT,
+            product_sk      BIGINT,
+            date_key        INTEGER,
+            order_timestamp TIMESTAMPTZ NOT NULL,
+            quantity        INTEGER,
+            revenue         NUMERIC(12, 2),
+            profit          NUMERIC(12, 2),
+            order_status    TEXT,
+            payment_method  TEXT,
+            UNIQUE (order_id, order_timestamp)
+        ) PARTITION BY RANGE (order_timestamp);
+
+        -- Default partition catches anything outside explicit monthly ranges
+        CREATE TABLE IF NOT EXISTS analytics.fact_orders_default
+            PARTITION OF analytics.fact_orders DEFAULT;
+
+        CREATE INDEX IF NOT EXISTS idx_fo_order_id
+            ON analytics.fact_orders(order_id);
+        CREATE INDEX IF NOT EXISTS idx_fo_customer
+            ON analytics.fact_orders(customer_sk);
+        CREATE INDEX IF NOT EXISTS idx_fo_product
+            ON analytics.fact_orders(product_sk);
+        CREATE INDEX IF NOT EXISTS idx_fo_date
+            ON analytics.fact_orders(date_key);
+    """
+
+    partition_ddl = """
+        DO $$
+        DECLARE
+            y INT; m INT; p_name TEXT; p_from TEXT; p_to TEXT;
+        BEGIN
+            FOR y IN 2024..2026 LOOP
+                FOR m IN 1..12 LOOP
+                    p_name := format('fact_orders_%s_%s', y, lpad(m::text, 2, '0'));
+                    p_from := format('%s-%s-01', y, lpad(m::text, 2, '0'));
+                    p_to   := format('%s-%s-01',
+                        CASE WHEN m = 12 THEN y + 1 ELSE y END,
+                        lpad((CASE WHEN m = 12 THEN 1 ELSE m + 1 END)::text, 2, '0')
+                    );
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'analytics' AND c.relname = p_name
+                    ) THEN
+                        EXECUTE format(
+                            'CREATE TABLE IF NOT EXISTS analytics.%I
+                             PARTITION OF analytics.fact_orders
+                             FOR VALUES FROM (%L) TO (%L)',
+                            p_name, p_from, p_to
+                        );
+                    END IF;
+                END LOOP;
+            END LOOP;
+        END;
+        $$;
+    """
+
+    dim_date_ddl = """
+        INSERT INTO analytics.dim_date (
+            date_key, full_date, day_of_week, day_name, day_of_month,
+            day_of_year, week_of_year, month_number, month_name,
+            quarter, year, is_weekend
+        )
+        SELECT
+            TO_CHAR(d, 'YYYYMMDD')::INTEGER,
+            d,
+            EXTRACT(DOW  FROM d)::SMALLINT,
+            TO_CHAR(d, 'Day'),
+            EXTRACT(DAY  FROM d)::SMALLINT,
+            EXTRACT(DOY  FROM d)::SMALLINT,
+            EXTRACT(WEEK FROM d)::SMALLINT,
+            EXTRACT(MONTH FROM d)::SMALLINT,
+            TO_CHAR(d, 'Month'),
+            EXTRACT(QUARTER FROM d)::SMALLINT,
+            EXTRACT(YEAR FROM d)::SMALLINT,
+            EXTRACT(DOW FROM d) IN (0, 6)
+        FROM generate_series(
+            '2024-01-01'::DATE,
+            '2026-12-31'::DATE,
+            '1 day'::INTERVAL
+        ) AS gs(d)
+        ON CONFLICT (date_key) DO NOTHING;
+    """
+
+    with transaction() as cur:
+        cur.execute(ddl)
+        cur.execute(fact_orders_ddl)
+        cur.execute(partition_ddl)
+        cur.execute(dim_date_ddl)
+    logger.info("ensure_analytics_schema: all tables verified/created successfully")
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +537,11 @@ def run_all_transforms() -> dict[str, int]:
     Execute all staging → analytics transforms in dependency order.
     Returns a map of {table_name: rows_affected}.
     """
+    # Bootstrap: ensure all analytics tables exist before we try to write to them.
+    # This is a safety net for cases where the Postgres volume already existed
+    # and init scripts did not run.  All DDL is idempotent (IF NOT EXISTS).
+    ensure_analytics_schema()
+
     results = {}
     results["dim_customers"]  = transform_dim_customers()
     results["dim_products"]   = transform_dim_products()
