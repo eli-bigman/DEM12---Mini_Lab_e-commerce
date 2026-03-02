@@ -3,12 +3,28 @@ name: CI Pipeline
 on:
   push:
     branches: [main, master]
+    paths:
+      - "airflow/**"
+      - "collector/**"
+      - "postgres/**"
+      - "tests/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - "requirements-dev.txt"
   pull_request:
     branches: [main, master]
+    paths:
+      - "airflow/**"
+      - "collector/**"
+      - "postgres/**"
+      - "tests/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - "requirements-dev.txt"
 
 jobs:
   # ------------------------------------------------------------
-  # Job 1: Unit and integration tests
+  # Job 1: Unit tests
   # ------------------------------------------------------------
   test:
     name: Run Unit Tests
@@ -25,11 +41,6 @@ jobs:
 
       - name: Install test dependencies
         run: pip install -r requirements-dev.txt
-
-      - name: Install Airflow (for DAG integrity tests)
-        run: |
-          pip install apache-airflow==2.9.3 \
-            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt"
 
       - name: Run pytest (validators and cleaners)
         run: pytest tests/test_validators.py tests/test_cleaners.py -v --tb=short
@@ -68,10 +79,21 @@ jobs:
       - name: Start the full stack
         run: docker compose up -d --build
 
-      - name: Wait for all services to be healthy
+      - name: Wait for Airflow webserver to be healthy
         run: |
-          echo "Waiting for services..."
-          sleep 90
+          echo "Polling Airflow health endpoint..."
+          for i in $(seq 1 40); do
+            STATUS=$(curl -sf http://localhost:8080/health 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); \
+                print(d.get('metadatabase',{}).get('status','unhealthy'))" 2>/dev/null \
+              || echo "unhealthy")
+            echo "Airflow status: $STATUS (attempt $i/40)"
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Airflow is ready."
+              break
+            fi
+            sleep 10
+          done
 
       - name: Verify database connection
         run: |
@@ -82,29 +104,72 @@ jobs:
         run: |
           docker exec ecommerce_postgres psql \
             -U ecommerce_user -d ecommerce \
-            -c "SELECT COUNT(*) FROM analytics.dim_date;" \
-            -c "SELECT COUNT(*) FROM analytics.fact_orders;" \
-            -c "SELECT COUNT(*) FROM staging.processed_files;"
+            -c "SELECT COUNT(*) AS dim_date_rows   FROM analytics.dim_date;" \
+            -c "SELECT COUNT(*) AS fact_order_rows FROM analytics.fact_orders;" \
+            -c "SELECT COUNT(*) AS staging_files   FROM staging.processed_files;"
+
+      - name: Wait for Collector to generate at least one batch
+        run: |
+          echo "Waiting for Collector to write files to MinIO..."
+          for i in $(seq 1 15); do
+            FILE_COUNT=$(docker exec ecommerce_minio \
+              mc ls --recursive local/raw-data 2>/dev/null | wc -l || echo 0)
+            echo "MinIO file count: $FILE_COUNT (attempt $i/15)"
+            if [ "$FILE_COUNT" -gt "0" ]; then
+              echo "Collector has generated data."
+              break
+            fi
+            sleep 10
+          done
 
       - name: Trigger the ecommerce pipeline DAG
         run: |
           docker exec ecommerce_airflow_webserver \
             airflow dags trigger ecommerce_pipeline
 
-      - name: Wait for pipeline to process initial data
-        run: sleep 120
+      - name: Poll for DAG run completion
+        run: |
+          echo "Polling DAG run status..."
+          FINAL_STATUS="unknown"
+          for i in $(seq 1 30); do
+            sleep 15
+            FINAL_STATUS=$(docker exec ecommerce_airflow_webserver \
+              airflow dags list-runs -d ecommerce_pipeline \
+              --no-backfill -o plain 2>/dev/null \
+              | awk 'NR==2 {print $4}' || echo "unknown")
+            echo "DAG run status: $FINAL_STATUS (attempt $i/30)"
+            if [ "$FINAL_STATUS" = "success" ] || [ "$FINAL_STATUS" = "failed" ]; then
+              break
+            fi
+          done
+
+          if [ "$FINAL_STATUS" = "failed" ]; then
+            echo "FAIL: DAG run reported failure."
+            docker exec ecommerce_airflow_webserver \
+              airflow tasks states-for-dag-run ecommerce_pipeline \
+              $(docker exec ecommerce_airflow_webserver \
+                airflow dags list-runs -d ecommerce_pipeline \
+                --no-backfill -o plain | awk 'NR==2 {print $3}') \
+              2>/dev/null || true
+            exit 1
+          fi
 
       - name: Confirm fact_orders has rows
         run: |
           ROW_COUNT=$(docker exec ecommerce_postgres psql \
             -U ecommerce_user -d ecommerce -t \
-            -c "SELECT COUNT(*) FROM analytics.fact_orders;" | tr -d ' ')
+            -c "SELECT COUNT(*) FROM analytics.fact_orders;" | tr -d ' \n')
           echo "fact_orders rows: $ROW_COUNT"
           if [ "$ROW_COUNT" -eq "0" ]; then
             echo "FAIL: fact_orders is empty after pipeline run"
+            # Print staging row counts for debugging
+            docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
+              -c "SELECT 'staging.orders' AS t, COUNT(*) FROM staging.orders
+                  UNION ALL SELECT 'staging.customers', COUNT(*) FROM staging.customers
+                  UNION ALL SELECT 'processed_files',   COUNT(*) FROM staging.processed_files;"
             exit 1
           fi
-          echo "PASS: fact_orders has $ROW_COUNT rows"
+          echo "PASS: fact_orders has $ROW_COUNT rows."
 
       - name: Tear down stack
         if: always()
