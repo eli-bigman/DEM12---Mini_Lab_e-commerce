@@ -19,8 +19,8 @@ services:
       COLLECTOR_BATCH_INTERVAL_SECONDS: ${COLLECTOR_BATCH_INTERVAL_SECONDS:-60}
       COLLECTOR_BATCH_SIZE: ${COLLECTOR_BATCH_SIZE:-50}
     depends_on:
-      minio:
-        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     networks:
       - platform_net
 

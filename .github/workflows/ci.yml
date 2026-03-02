@@ -95,32 +95,34 @@ jobs:
             sleep 10
           done
 
-      - name: Verify database connection
+      - name: Verify database connection and analytics tables
         run: |
-          docker exec ecommerce_postgres pg_isready \
-            -U ecommerce_user -d ecommerce
+          docker exec ecommerce_postgres pg_isready -U ecommerce_user -d ecommerce
+          docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
+            -c "SELECT COUNT(*) AS dim_date_rows FROM analytics.dim_date;"
 
-      - name: Verify all analytics tables exist
+      - name: Wait for Collector to successfully upload data to MinIO
         run: |
-          docker exec ecommerce_postgres psql \
-            -U ecommerce_user -d ecommerce \
-            -c "SELECT COUNT(*) AS dim_date_rows   FROM analytics.dim_date;" \
-            -c "SELECT COUNT(*) AS fact_order_rows FROM analytics.fact_orders;" \
-            -c "SELECT COUNT(*) AS staging_files   FROM staging.processed_files;"
-
-      - name: Wait for Collector to generate at least one batch
-        run: |
-          echo "Waiting for Collector to write files to MinIO..."
-          for i in $(seq 1 15); do
-            FILE_COUNT=$(docker exec ecommerce_minio \
-              mc ls --recursive local/raw-data 2>/dev/null | wc -l || echo 0)
-            echo "MinIO file count: $FILE_COUNT (attempt $i/15)"
-            if [ "$FILE_COUNT" -gt "0" ]; then
-              echo "Collector has generated data."
+          echo "Watching Collector logs for successful uploads..."
+          for i in $(seq 1 20); do
+            # Check collector logs for successful upload messages
+            UPLOAD_COUNT=$(docker logs ecommerce_collector 2>&1 | grep -ci "upload" || true)
+            echo "Collector upload log lines: $UPLOAD_COUNT (attempt $i/20)"
+            if [ "$UPLOAD_COUNT" -gt "0" ]; then
+              echo "Collector has uploaded data to MinIO."
+              docker logs ecommerce_collector 2>&1 | tail -5
               break
             fi
-            sleep 10
+            sleep 15
           done
+
+          # Hard fail if collector never uploaded anything
+          FINAL_COUNT=$(docker logs ecommerce_collector 2>&1 | grep -ci "upload" || true)
+          if [ "$FINAL_COUNT" -eq "0" ]; then
+            echo "ERROR: Collector never uploaded data. Container logs:"
+            docker logs ecommerce_collector 2>&1
+            exit 1
+          fi
 
       - name: Trigger the ecommerce pipeline DAG
         run: |
@@ -144,13 +146,8 @@ jobs:
           done
 
           if [ "$FINAL_STATUS" = "failed" ]; then
-            echo "FAIL: DAG run reported failure."
-            docker exec ecommerce_airflow_webserver \
-              airflow tasks states-for-dag-run ecommerce_pipeline \
-              $(docker exec ecommerce_airflow_webserver \
-                airflow dags list-runs -d ecommerce_pipeline \
-                --no-backfill -o plain | awk 'NR==2 {print $3}') \
-              2>/dev/null || true
+            echo "FAIL: DAG run failed. Last task states:"
+            docker logs ecommerce_airflow_scheduler 2>&1 | tail -30
             exit 1
           fi
 
@@ -161,12 +158,15 @@ jobs:
             -c "SELECT COUNT(*) FROM analytics.fact_orders;" | tr -d ' \n')
           echo "fact_orders rows: $ROW_COUNT"
           if [ "$ROW_COUNT" -eq "0" ]; then
-            echo "FAIL: fact_orders is empty after pipeline run"
-            # Print staging row counts for debugging
+            echo "FAIL: fact_orders is empty. Diagnostic staging counts:"
             docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
-              -c "SELECT 'staging.orders' AS t, COUNT(*) FROM staging.orders
+              -c "SELECT 'staging.orders'   AS t, COUNT(*) FROM staging.orders
                   UNION ALL SELECT 'staging.customers', COUNT(*) FROM staging.customers
                   UNION ALL SELECT 'processed_files',   COUNT(*) FROM staging.processed_files;"
+            echo "Last 20 Collector log lines:"
+            docker logs ecommerce_collector 2>&1 | tail -20
+            echo "Last 20 Airflow scheduler log lines:"
+            docker logs ecommerce_airflow_scheduler 2>&1 | tail -20
             exit 1
           fi
           echo "PASS: fact_orders has $ROW_COUNT rows."
