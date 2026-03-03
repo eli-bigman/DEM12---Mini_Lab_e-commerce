@@ -9,7 +9,7 @@
 --   - All upserts use INSERT ... ON CONFLICT for idempotency.
 --   - Indexes placed on all foreign keys and common filter columns.
 -- ============================================================
-\ connect ecommerce
+\connect ecommerce
 SET search_path TO analytics;
 -- ============================================================
 -- DIMENSION TABLES
