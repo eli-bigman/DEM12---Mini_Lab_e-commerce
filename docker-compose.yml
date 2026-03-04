@@ -262,7 +262,7 @@ services:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: metabase_user
+      POSTGRES_USER: ${MB_DB_USER:-metabase_user}
       MB_DB_PASS: ${MB_DB_PASS}
     volumes:
       - ./metabase:/app
