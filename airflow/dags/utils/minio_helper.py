@@ -10,6 +10,7 @@ import io
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Iterator
 
 import pandas as pd
 from minio import Minio
@@ -47,30 +48,28 @@ def list_objects(client: Minio, bucket: str, prefix: str = "") -> list[str]:
     return [obj.object_name for obj in objects]
 
 
-def read_csv(client: Minio, bucket: str, object_path: str) -> pd.DataFrame:
+def read_csv(client: Minio, bucket: str, object_path: str, chunksize: int = 10000) -> Iterator[pd.DataFrame]:
     """
-    Download a CSV object from MinIO and return it as a pandas DataFrame.
+    Download a CSV object from MinIO and yield it as pandas DataFrame chunks.
 
     Parameters
     ----------
     client      : MinIO client
     bucket      : Source bucket name
     object_path : Full object path within the bucket
+    chunksize   : Number of rows per chunk
 
     Returns
     -------
-    pandas DataFrame with all columns as strings (type enforcement comes later).
+    Iterator of pandas DataFrames.
     """
     response = client.get_object(bucket, object_path)
     try:
-        raw = response.read()
+        for chunk in pd.read_csv(response, dtype=str, chunksize=chunksize):
+            yield chunk
     finally:
         response.close()
         response.release_conn()
-
-    df = pd.read_csv(io.BytesIO(raw), dtype=str)
-    logger.info("Read %d rows from s3://%s/%s", len(df), bucket, object_path)
-    return df
 
 
 def send_to_quarantine(
@@ -78,12 +77,13 @@ def send_to_quarantine(
     entity: str,
     source_path: str,
     df: pd.DataFrame,
+    chunk_index: int = 0
 ) -> str:
     """
     Upload a DataFrame of rejected rows to the quarantine bucket.
 
     The quarantine path mirrors the source path:
-        quarantine/{entity}/YYYY/MM/DD/{original_filename}_quarantine.csv
+        quarantine/{entity}/YYYY/MM/DD/{original_filename}_quarantine_{chunk_index}.csv
 
     Parameters
     ----------
@@ -91,13 +91,14 @@ def send_to_quarantine(
     entity      : Entity name (e.g. 'orders')
     source_path : Original MinIO object path (used to derive quarantine path)
     df          : DataFrame of invalid rows to quarantine
+    chunk_index : Index of the chunk to prevent overwrites
 
     Returns
     -------
     Full quarantine object path.
     """
     now = datetime.now(tz=timezone.utc)
-    filename = source_path.split("/")[-1].replace(".csv", "_quarantine.csv")
+    filename = source_path.split("/")[-1].replace(".csv", f"_quarantine_{chunk_index}.csv")
     quarantine_path = (
         f"{entity}/{now.strftime('%Y/%m/%d')}/{filename}"
     )

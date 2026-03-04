@@ -79,46 +79,47 @@ def _process_entity(entity: str) -> dict:
 
     for obj_path in new_paths:
         try:
-            df = read_csv(client, bucket, obj_path)
+            file_valid = 0
+            file_invalid = 0
+            
+            for chunk_idx, df in enumerate(read_csv(client, bucket, obj_path)):
+                # -- Validate --
+                valid_df, invalid_df = validate(entity, df)
 
-            # -- Validate --
-            valid_df, invalid_df = validate(entity, df)
+                # -- DLQ: quarantine invalid rows --
+                quarantine_count = 0
+                if not invalid_df.empty:
+                    send_to_quarantine(client, entity, obj_path, invalid_df, chunk_idx)
+                    quarantine_count = len(invalid_df)
 
-            # -- DLQ: quarantine invalid rows --
-            quarantine_count = 0
-            if not invalid_df.empty:
-                send_to_quarantine(client, entity, obj_path, invalid_df)
-                quarantine_count = len(invalid_df)
+                # -- Skip entirely if nothing is valid in chunk --
+                if valid_df.empty:
+                    file_invalid += quarantine_count
+                    continue
 
-            # -- Skip entirely if nothing is valid --
-            if valid_df.empty:
-                logger.warning("No valid rows in %s, skipping load.", obj_path)
-                mark_file_processed(
-                    obj_path, entity,
-                    row_count=0,
-                    quarantine_count=quarantine_count,
-                    status="partial" if quarantine_count > 0 else "success",
-                )
-                total_invalid += quarantine_count
-                continue
+                # -- Clean --
+                clean_df = clean(entity, valid_df)
 
-            # -- Clean --
-            clean_df = clean(entity, valid_df)
+                # -- Load to staging --
+                load_to_staging(entity, clean_df, source_file=obj_path)
 
-            # -- Load to staging --
-            load_to_staging(entity, clean_df, source_file=obj_path)
+                file_valid += len(clean_df)
+                file_invalid += quarantine_count
 
             # -- Mark as processed --
-            status = "partial" if quarantine_count > 0 else "success"
+            if file_valid == 0 and file_invalid == 0:
+                logger.warning("File %s was completely empty.", obj_path)
+                
+            status = "partial" if file_invalid > 0 else "success"
             mark_file_processed(
                 obj_path, entity,
-                row_count=len(clean_df),
-                quarantine_count=quarantine_count,
+                row_count=file_valid,
+                quarantine_count=file_invalid,
                 status=status,
             )
 
-            total_valid += len(clean_df)
-            total_invalid += quarantine_count
+            total_valid += file_valid
+            total_invalid += file_invalid
 
         except Exception as exc:
             logger.error("Failed processing %s: %s", obj_path, exc, exc_info=True)
