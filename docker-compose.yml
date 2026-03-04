@@ -245,6 +245,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - platform_net
   # ============================================================
   # Seed Metabase: Script to automatically seed Metabase dashboards
   # ============================================================
