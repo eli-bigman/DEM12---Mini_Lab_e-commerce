@@ -164,6 +164,20 @@ jobs:
 
       - name: Trigger the ecommerce pipeline DAG
         run: |
+          echo "Waiting for DAG to be parsed by scheduler..."
+          for i in $(seq 1 30); do
+            if docker exec ecommerce_airflow_webserver airflow dags list | grep -q 'ecommerce_pipeline'; then
+              echo "DAG registered!"
+              break
+            fi
+            echo "Waiting 5s for DAG registration... (attempt $i/30)"
+            sleep 5
+            if [ "$i" = "30" ]; then
+              echo "ERROR: DAG never registered."
+              exit 1
+            fi
+          done
+
           docker exec ecommerce_airflow_webserver \
             airflow dags unpause ecommerce_pipeline
           docker exec ecommerce_airflow_webserver \
