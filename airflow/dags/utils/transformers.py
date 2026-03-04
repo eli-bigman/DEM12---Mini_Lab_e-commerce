@@ -363,7 +363,15 @@ def transform_dim_products() -> int:
 # ---------------------------------------------------------------------------
 
 def transform_dim_inventory() -> int:
-    """Upsert staging.inventory into analytics.dim_inventory (current snapshot)."""
+    """Upsert staging.inventory into analytics.dim_inventory (current snapshot).
+    Zero-out missing inventory via pre-update.
+    """
+    sql_zero = """
+        UPDATE analytics.dim_inventory
+        SET quantity_on_hand = 0,
+            updated_at = NOW()
+        WHERE quantity_on_hand > 0
+    """
     sql = """
         INSERT INTO analytics.dim_inventory
             (inventory_id, product_id, warehouse_location,
@@ -382,6 +390,7 @@ def transform_dim_inventory() -> int:
             updated_at        = NOW()
     """
     with transaction() as cur:
+        cur.execute(sql_zero)
         cur.execute(sql)
         n = cur.rowcount
     logger.info("dim_inventory upserted %d rows", n)
@@ -394,13 +403,17 @@ def transform_dim_inventory() -> int:
 
 def transform_fact_orders() -> int:
     """
-    Upsert staging.orders into analytics.fact_orders.
+    Merge staging.orders into analytics.fact_orders.
 
     Resolves surrogate keys from the current SCD2 dimension rows.
-    Handles CDC by upserting order_status so late-arriving status
-    changes (e.g. Pending → Refunded) overwrite the previous value.
+    Uses DELETE-then-INSERT to cleanly handle late arriving updates 
+    and prevent duplication if the timestamp was changed.
     """
-    sql = """
+    sql_delete = """
+        DELETE FROM analytics.fact_orders
+        WHERE order_id IN (SELECT DISTINCT order_id::UUID FROM staging.orders)
+    """
+    sql_insert = """
         INSERT INTO analytics.fact_orders
             (order_id, customer_sk, product_sk, date_key,
              order_timestamp, quantity, revenue, profit,
@@ -422,13 +435,10 @@ def transform_fact_orders() -> int:
             ON dc.customer_id = o.customer_id::UUID AND dc.is_current = TRUE
         LEFT JOIN analytics.dim_products dp
             ON dp.product_id = o.product_id::UUID AND dp.is_current = TRUE
-        ON CONFLICT (order_id, order_timestamp) DO UPDATE SET
-            order_status = EXCLUDED.order_status,
-            revenue      = EXCLUDED.revenue,
-            profit       = EXCLUDED.profit
     """
     with transaction() as cur:
-        cur.execute(sql)
+        cur.execute(sql_delete)
+        cur.execute(sql_insert)
         n = cur.rowcount
     logger.info("fact_orders upserted %d rows", n)
     return n
@@ -500,10 +510,14 @@ def transform_agg_revenue() -> int:
     """
     Rebuild agg_revenue from staging.revenue.
     Uses DELETE-then-INSERT for idempotency on the same record_date.
+    Optimized to only process recently modified records.
     """
     sql_delete = """
         DELETE FROM analytics.agg_revenue
-        WHERE record_date IN (SELECT DISTINCT record_date::DATE FROM staging.revenue)
+        WHERE record_date IN (
+            SELECT DISTINCT record_date::DATE FROM staging.revenue
+            WHERE _loaded_at >= NOW() - INTERVAL '2 hours'
+        )
     """
     sql_insert = """
         INSERT INTO analytics.agg_revenue
@@ -518,6 +532,10 @@ def transform_agg_revenue() -> int:
         LEFT JOIN staging.orders o
             ON o.order_timestamp::DATE = s.record_date::DATE
                AND o.order_status = 'Completed'
+        WHERE s.record_date::DATE IN (
+            SELECT DISTINCT record_date::DATE FROM staging.revenue
+            WHERE _loaded_at >= NOW() - INTERVAL '2 hours'
+        )
         GROUP BY s.record_date::DATE
     """
     with transaction() as cur:
