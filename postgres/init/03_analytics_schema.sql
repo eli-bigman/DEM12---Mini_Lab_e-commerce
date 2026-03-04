@@ -9,7 +9,6 @@
 --   - All upserts use INSERT ... ON CONFLICT for idempotency.
 --   - Indexes placed on all foreign keys and common filter columns.
 -- ============================================================
-\connect ecommerce
 SET search_path TO analytics;
 -- ============================================================
 -- DIMENSION TABLES
@@ -53,6 +52,8 @@ CREATE TABLE IF NOT EXISTS analytics.dim_customers (
 );
 CREATE INDEX IF NOT EXISTS idx_dim_cust_nk ON analytics.dim_customers(customer_id);
 CREATE INDEX IF NOT EXISTS idx_dim_cust_current ON analytics.dim_customers(customer_id, is_current);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_cust_current_unique ON analytics.dim_customers(customer_id)
+WHERE is_current = TRUE;
 -- ------------------------------------------------------------
 -- dim_products: SCD Type 2
 -- ------------------------------------------------------------
@@ -69,6 +70,8 @@ CREATE TABLE IF NOT EXISTS analytics.dim_products (
 );
 CREATE INDEX IF NOT EXISTS idx_dim_prod_nk ON analytics.dim_products(product_id);
 CREATE INDEX IF NOT EXISTS idx_dim_prod_current ON analytics.dim_products(product_id, is_current);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_prod_current_unique ON analytics.dim_products(product_id)
+WHERE is_current = TRUE;
 -- ------------------------------------------------------------
 -- dim_inventory: Non-SCD (current snapshot only)
 -- ------------------------------------------------------------
