@@ -23,14 +23,16 @@ CREATE OR REPLACE VIEW analytics.v_kpi_summary AS WITH current_period AS (
     last_month_customers AS (
         SELECT COUNT(DISTINCT customer_id)::NUMERIC AS cnt
         FROM analytics.dim_customers
-        WHERE valid_from >= NOW() - INTERVAL '30 days'
+        WHERE signup_date >= CURRENT_DATE - INTERVAL '30 days'
+            AND signup_date < CURRENT_DATE
             AND is_current = TRUE
     ),
     prior_month_customers AS (
         SELECT COUNT(DISTINCT customer_id)::NUMERIC AS cnt
         FROM analytics.dim_customers
-        WHERE valid_from >= NOW() - INTERVAL '60 days'
-            AND valid_from < NOW() - INTERVAL '30 days'
+        WHERE signup_date >= CURRENT_DATE - INTERVAL '60 days'
+            AND signup_date < CURRENT_DATE - INTERVAL '30 days'
+            AND is_current = TRUE
     )
 SELECT cp.total_revenue,
     cp.total_profit,
