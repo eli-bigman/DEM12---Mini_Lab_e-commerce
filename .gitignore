@@ -45,3 +45,4 @@ Thumbs.db
 *.md
 !README.md
 !ARCHITECTURE.md
+!metabase/DASHBOARD_CHART_GUIDE.md
