@@ -91,6 +91,36 @@ Use these cards first for a 20-second snapshot:
 - What it means: Return case volumes and refund amounts by status.
 - Why it matters: Quantifies return risk and customer experience friction.
 
+### Monthly Active Customers
+- Source: analytics.fact_orders
+- What it means: Number of unique customers placing completed orders each month.
+- Why it matters: Indicates whether the customer base is consistently active over time.
+
+### Orders and Revenue by Weekday
+- Source: analytics.fact_orders
+- What it means: Completed order volume and revenue by day of week.
+- Why it matters: Helps with staffing, campaign timing, and operational planning.
+
+### Top 10 Countries by Revenue
+- Source: analytics.fact_orders + analytics.dim_customers
+- What it means: Geographic concentration of revenue and order volume.
+- Why it matters: Supports localization, market expansion, and logistics prioritization.
+
+### Monthly Refund Trend
+- Source: analytics.fact_returns
+- What it means: Total refund amount over monthly periods.
+- Why it matters: Tracks return pressure and its impact on net revenue.
+
+### Repeat Customer Rate (%)
+- Source: analytics.fact_orders
+- What it means: Percentage of customers with more than one completed order.
+- Why it matters: Core indicator of retention strength and customer lifetime potential.
+
+### Average Items per Order
+- Source: analytics.fact_orders
+- What it means: Average quantity of items per completed order.
+- Why it matters: Helps evaluate basket depth and bundling effectiveness.
+
 ## Visual Design Notes (Color + Detail)
 
 Card visuals are intentionally configured with stronger colors and value labels to improve scanability:

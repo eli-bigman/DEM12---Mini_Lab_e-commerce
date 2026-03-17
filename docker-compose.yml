@@ -84,6 +84,8 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # All init scripts in this folder run automatically on first DB creation,
+      # including 05_seed_three_months.sql for dashboard bootstrap data.
       - ./postgres/init:/docker-entrypoint-initdb.d
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
@@ -248,11 +250,11 @@ services:
     networks:
       - platform_net
   # ============================================================
-  # Seed Metabase: Script to automatically seed Metabase dashboards
+  # Dashboard Metabase: Script to automatically provision dashboard assets
   # ============================================================
-  seed-metabase:
+  dashboard-metabase:
     image: python:3.11-slim
-    container_name: ecommerce_seed_metabase
+    container_name: ecommerce_dashboard_metabase
     profiles:
       - seed
     env_file:
@@ -269,7 +271,7 @@ services:
     volumes:
       - ./metabase:/app
     working_dir: /app
-    command: bash -c "pip install -q -r requirements.txt && python seed.py"
+    command: bash -c "pip install -q -r requirements.txt && python dashboard.py"
     networks:
       - platform_net
 

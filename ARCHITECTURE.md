@@ -88,7 +88,7 @@ dem12-mini-lab/
 │
 ├── metabase/
 │   ├── requirements.txt             # requests (for Metabase REST API)
-│   └── seed.py                      # Provisions Metabase via API: DB, cards, dashboard
+│   └── dashboard.py                 # Provisions Metabase via API: DB, cards, dashboard
 │
 ├── postgres/
 │   └── init/
@@ -390,7 +390,7 @@ PostgreSQL runs all `.sql` files in `postgres/init/` alphabetically on first sta
 
 **Service:** `metabase` in `docker-compose.yml`
 
-**Files:** `metabase/seed.py`, `metabase/requirements.txt`
+**Files:** `metabase/dashboard.py`, `metabase/requirements.txt`
 
 **Purpose:** The business intelligence layer. Provides an interactive dashboard UI that non-technical users can use to view KPIs and trends.
 
@@ -400,7 +400,7 @@ Metabase connects as `metabase_user` which has `SELECT`-only privileges on the `
 
 #### Dashboard seeding
 
-`metabase/seed.py` uses the Metabase REST API to provision everything automatically:
+`metabase/dashboard.py` uses the Metabase REST API to provision everything automatically:
 
 1. Polls `/api/health` until Metabase is ready
 2. Hits `/api/session/properties` to get the setup token
@@ -411,7 +411,7 @@ Metabase connects as `metabase_user` which has `SELECT`-only privileges on the `
 7. Creates the dashboard via `/api/dashboard`
 8. Adds all cards to the dashboard with a two-column grid layout
 
-All of these steps are idempotent — if a card or database already exists with the same name, `seed.py` uses its existing ID rather than creating a duplicate.
+All of these steps are idempotent — if a card or database already exists with the same name, `dashboard.py` uses its existing ID rather than creating a duplicate.
 
 #### The seven dashboard views
 
@@ -699,7 +699,7 @@ All variables live in `.env`. Copy from `.env.example` before first run.
 | `POSTGRES_USER` | Airflow, Init | Main app user |
 | `POSTGRES_PASSWORD` | Airflow, Init | Main app password |
 | `MB_DB_USER` | Metabase | Read-only Metabase role |
-| `MB_DB_PASS` | Metabase, seed.py | Metabase role password |
+| `MB_DB_PASS` | Metabase, dashboard.py | Metabase role password |
 
 ### MinIO
 
@@ -732,9 +732,9 @@ All variables live in `.env`. Copy from `.env.example` before first run.
 
 | Variable | Used by | Description |
 |---|---|---|
-| `METABASE_ADMIN_EMAIL` | seed.py | Admin email for dashboard seeding |
-| `METABASE_ADMIN_PASSWORD` | seed.py | Admin password for dashboard seeding |
-| `METABASE_URL` | seed.py | Metabase base URL (default: `http://localhost:3000`) |
+| `METABASE_ADMIN_EMAIL` | dashboard.py | Admin email for dashboard seeding |
+| `METABASE_ADMIN_PASSWORD` | dashboard.py | Admin password for dashboard seeding |
+| `METABASE_URL` | dashboard.py | Metabase base URL (default: `http://localhost:3000`) |
 
 ---
 
@@ -808,13 +808,13 @@ docker compose restart collector
    SELECT ...
    ```
    Apply it via `make psql`.
-2. Add a new entry to the `CARDS` list in `metabase/seed.py`:
+2. Add a new entry to the `CARDS` list in `metabase/dashboard.py`:
    ```python
    {"name": "My New Metric", "display": "scalar", "query": "SELECT ... FROM analytics.v_my_new_metric"},
    ```
 3. Re-run:
    ```bash
-   make seed-metabase
+   make dashboard-metabase
    ```
    The script will create the new card and add it to the existing dashboard (idempotent).
 

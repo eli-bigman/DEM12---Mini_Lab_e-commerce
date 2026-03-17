@@ -63,7 +63,7 @@ docker compose up -d --build
 | Metabase | http://localhost:3000 | First-launch setup wizard |
 | PostgreSQL | `localhost:5432` | Credentials from `.env` |
 
-### 4. Seed the Metabase dashboard
+### 4. Provision the Metabase dashboard
 
 After completing the Metabase first-launch setup, add your admin credentials to `.env`:
 
@@ -75,10 +75,24 @@ METABASE_ADMIN_PASSWORD=yourpassword
 Then run:
 
 ```bash
-make seed-metabase
+make dashboard-metabase
 ```
 
 This will automatically connect Metabase to PostgreSQL and provision 11 question cards and the executive dashboard.
+
+### Dashboard Preview
+
+| Executive Overview | Operations & Risk |
+|---|---|
+| ![Executive Dashboard - Overall Business](assets/overall_business.png) | ![Executive Dashboard - Ops and Risk](assets/ops_and_risk.png) |
+
+| Deep Dive 1 | Deep Dive 2 |
+|---|---|
+| ![Deep Dive Dashboard 1](assets/Deep_dive01.png) | ![Deep Dive Dashboard 2](assets/Deep_dive02.png) |
+
+| Deep Dive 3 |
+|---|
+| ![Deep Dive Dashboard 3](assets/Deep_dive03.png) |
 
 ---
 
@@ -102,7 +116,7 @@ make row-counts     # Print row counts for key analytics tables
 make trigger        # Manually trigger the ecommerce_pipeline DAG
 make dag-list       # List all registered Airflow DAGs
 
-make seed-metabase  # Seed Metabase with dashboards via the REST API
+make dashboard-metabase  # Provision Metabase dashboards via the REST API
 
 make test           # Run the full pytest unit test suite
 
@@ -228,7 +242,7 @@ pytest tests/test_validators.py tests/test_cleaners.py -v
 │   ├── uploader.py                # Time-partitioned MinIO upload
 │   └── generators/                # One module per entity
 ├── metabase/
-│   └── seed.py                    # Dashboard provisioning via Metabase API
+│   └── dashboard.py               # Dashboard provisioning via Metabase API
 ├── postgres/
 │   └── init/
 │       ├── 01_init.sql            # Roles, schemas, extensions
