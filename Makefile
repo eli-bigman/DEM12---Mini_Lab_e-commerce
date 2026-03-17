@@ -6,7 +6,7 @@
 # ============================================================
 
 .PHONY: help up down restart build logs ps \
-        init-db seed-metabase \
+	init-db dashboard-metabase \
         trigger-dag dag-logs \
         test test-unit test-dag \
         clean nuke
@@ -39,7 +39,7 @@ help:
 	@echo "  make dag-logs       Stream logs from the last pipeline run"
 	@echo ""
 	@echo "  Metabase"
-	@echo "  make seed-metabase  Seed Metabase dashboards via API"
+	@echo "  make dashboard-metabase  Provision Metabase dashboards via API"
 	@echo ""
 	@echo "  Testing"
 	@echo "  make test           Run the full unit test suite"
@@ -140,9 +140,9 @@ dag-logs:
 # Metabase
 # ============================================================
 
-seed-metabase:
-	@echo "Seeding Metabase dashboards via Docker ..."
-	docker compose run --rm seed-metabase
+dashboard-metabase:
+	@echo "Provisioning Metabase dashboards via Docker ..."
+	docker compose run --rm dashboard-metabase
 
 # ============================================================
 # Testing
