@@ -107,49 +107,46 @@ CREATE TABLE IF NOT EXISTS analytics.fact_orders (
     payment_method TEXT,
     UNIQUE (order_id, order_timestamp)
 ) PARTITION BY RANGE (order_timestamp);
--- Create monthly partitions for a 2-year window (2024–2025)
+-- Create monthly partitions for a rolling window
 DO $$
-DECLARE y INT;
-m INT;
-p_name TEXT;
-p_from TEXT;
-p_to TEXT;
-BEGIN FOR y IN 2024..2026 LOOP FOR m IN 1..12 LOOP p_name := format('fact_orders_%s_%s', y, lpad(m::text, 2, '0'));
-p_from := format('%s-%s-01', y, lpad(m::text, 2, '0'));
-p_to := format(
-    '%s-%s-01',
-    CASE
-        WHEN m = 12 THEN y + 1
-        ELSE y
-    END,
-    lpad(
-        (
-            CASE
-                WHEN m = 12 THEN 1
-                ELSE m + 1
-            END
-        )::text,
-        2,
-        '0'
-    )
-);
-IF NOT EXISTS (
-    SELECT 1
-    FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'analytics'
-        AND c.relname = p_name
-) THEN EXECUTE format(
-    'CREATE TABLE IF NOT EXISTS analytics.%I
-                     PARTITION OF analytics.fact_orders
-                     FOR VALUES FROM (%L) TO (%L)',
-    p_name,
-    p_from,
-    p_to
-);
-END IF;
-END LOOP;
-END LOOP;
+DECLARE
+    month_start DATE;
+    p_name TEXT;
+    p_from DATE;
+    p_to DATE;
+BEGIN
+    FOR month_start IN
+        SELECT generate_series(
+            date_trunc('month', CURRENT_DATE - INTERVAL '12 months')::DATE,
+            date_trunc('month', CURRENT_DATE + INTERVAL '24 months')::DATE,
+            INTERVAL '1 month'
+        )::DATE
+    LOOP
+        p_name := format(
+            'fact_orders_%s_%s',
+            EXTRACT(YEAR FROM month_start)::INT,
+            lpad(EXTRACT(MONTH FROM month_start)::INT::TEXT, 2, '0')
+        );
+        p_from := month_start;
+        p_to := (month_start + INTERVAL '1 month')::DATE;
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'analytics'
+              AND c.relname = p_name
+        ) THEN
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS analytics.%I
+                 PARTITION OF analytics.fact_orders
+                 FOR VALUES FROM (%L) TO (%L)',
+                p_name,
+                p_from,
+                p_to
+            );
+        END IF;
+    END LOOP;
 END;
 $$;
 -- Default partition for out-of-range data
@@ -198,68 +195,41 @@ CREATE TABLE IF NOT EXISTS analytics.agg_revenue (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 -- ============================================================
--- POPULATE dim_date (2024-01-01 through 2026-12-31)
+-- POPULATE dim_date for a rolling 4-year window
 -- ============================================================
-DO $$
-DECLARE d DATE := '2024-01-01';
-end_d DATE := '2026-12-31';
-BEGIN WHILE d <= end_d LOOP
 INSERT INTO analytics.dim_date (
-        date_key,
-        full_date,
-        day_of_week,
-        day_name,
-        day_of_month,
-        day_of_year,
-        week_of_year,
-        month_number,
-        month_name,
-        quarter,
-        year,
-        is_weekend
-    )
-VALUES (
-        TO_CHAR(d, 'YYYYMMDD')::INTEGER,
-        d,
-        EXTRACT(
-            DOW
-            FROM d
-        )::SMALLINT,
-        TO_CHAR(d, 'Day'),
-        EXTRACT(
-            DAY
-            FROM d
-        )::SMALLINT,
-        EXTRACT(
-            DOY
-            FROM d
-        )::SMALLINT,
-        EXTRACT(
-            WEEK
-            FROM d
-        )::SMALLINT,
-        EXTRACT(
-            MONTH
-            FROM d
-        )::SMALLINT,
-        TO_CHAR(d, 'Month'),
-        EXTRACT(
-            QUARTER
-            FROM d
-        )::SMALLINT,
-        EXTRACT(
-            YEAR
-            FROM d
-        )::SMALLINT,
-        EXTRACT(
-            DOW
-            FROM d
-        ) IN (0, 6)
-    ) ON CONFLICT (date_key) DO NOTHING;
-d := d + INTERVAL '1 day';
-END LOOP;
-END;
-$$;
+    date_key,
+    full_date,
+    day_of_week,
+    day_name,
+    day_of_month,
+    day_of_year,
+    week_of_year,
+    month_number,
+    month_name,
+    quarter,
+    year,
+    is_weekend
+)
+SELECT
+    TO_CHAR(d, 'YYYYMMDD')::INTEGER,
+    d,
+    EXTRACT(DOW FROM d)::SMALLINT,
+    TO_CHAR(d, 'Day'),
+    EXTRACT(DAY FROM d)::SMALLINT,
+    EXTRACT(DOY FROM d)::SMALLINT,
+    EXTRACT(WEEK FROM d)::SMALLINT,
+    EXTRACT(MONTH FROM d)::SMALLINT,
+    TO_CHAR(d, 'Month'),
+    EXTRACT(QUARTER FROM d)::SMALLINT,
+    EXTRACT(YEAR FROM d)::SMALLINT,
+    EXTRACT(DOW FROM d) IN (0, 6)
+FROM generate_series(
+    (CURRENT_DATE - INTERVAL '2 years')::DATE,
+    (CURRENT_DATE + INTERVAL '2 years')::DATE,
+    '1 day'::INTERVAL
+) AS gs(d)
+ON CONFLICT (date_key) DO NOTHING;
 -- Grant to Metabase
 GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO metabase_user;
 ALTER DEFAULT PRIVILEGES IN SCHEMA analytics

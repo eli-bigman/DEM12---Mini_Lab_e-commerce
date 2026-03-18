@@ -185,29 +185,37 @@ def ensure_analytics_schema() -> None:
     partition_ddl = """
         DO $$
         DECLARE
-            y INT; m INT; p_name TEXT; p_from TEXT; p_to TEXT;
+            month_start DATE;
+            p_name TEXT;
+            p_from DATE;
+            p_to DATE;
         BEGIN
-            FOR y IN 2024..2026 LOOP
-                FOR m IN 1..12 LOOP
-                    p_name := format('fact_orders_%s_%s', y, lpad(m::text, 2, '0'));
-                    p_from := format('%s-%s-01', y, lpad(m::text, 2, '0'));
-                    p_to   := format('%s-%s-01',
-                        CASE WHEN m = 12 THEN y + 1 ELSE y END,
-                        lpad((CASE WHEN m = 12 THEN 1 ELSE m + 1 END)::text, 2, '0')
+            FOR month_start IN
+                SELECT generate_series(
+                    date_trunc('month', CURRENT_DATE - INTERVAL '12 months')::DATE,
+                    date_trunc('month', CURRENT_DATE + INTERVAL '24 months')::DATE,
+                    INTERVAL '1 month'
+                )::DATE
+            LOOP
+                p_name := format('fact_orders_%s_%s',
+                    EXTRACT(YEAR FROM month_start)::INT,
+                    lpad(EXTRACT(MONTH FROM month_start)::INT::TEXT, 2, '0')
+                );
+                p_from := month_start;
+                p_to := (month_start + INTERVAL '1 month')::DATE;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'analytics' AND c.relname = p_name
+                ) THEN
+                    EXECUTE format(
+                        'CREATE TABLE IF NOT EXISTS analytics.%I
+                         PARTITION OF analytics.fact_orders
+                         FOR VALUES FROM (%L) TO (%L)',
+                        p_name, p_from, p_to
                     );
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_class c
-                        JOIN pg_namespace n ON n.oid = c.relnamespace
-                        WHERE n.nspname = 'analytics' AND c.relname = p_name
-                    ) THEN
-                        EXECUTE format(
-                            'CREATE TABLE IF NOT EXISTS analytics.%I
-                             PARTITION OF analytics.fact_orders
-                             FOR VALUES FROM (%L) TO (%L)',
-                            p_name, p_from, p_to
-                        );
-                    END IF;
-                END LOOP;
+                END IF;
             END LOOP;
         END;
         $$;
@@ -233,8 +241,8 @@ def ensure_analytics_schema() -> None:
             EXTRACT(YEAR FROM d)::SMALLINT,
             EXTRACT(DOW FROM d) IN (0, 6)
         FROM generate_series(
-            '2024-01-01'::DATE,
-            '2026-12-31'::DATE,
+            (CURRENT_DATE - INTERVAL '2 years')::DATE,
+            (CURRENT_DATE + INTERVAL '2 years')::DATE,
             '1 day'::INTERVAL
         ) AS gs(d)
         ON CONFLICT (date_key) DO NOTHING;
@@ -604,6 +612,23 @@ def refresh_dashboard_materialized_views() -> int:
     return count
 
 
+def check_default_partition_usage() -> int:
+    """Return count of rows in default partition and warn when non-zero."""
+    sql = "SELECT COUNT(*) AS cnt FROM analytics.fact_orders_default"
+    with transaction() as cur:
+        cur.execute(sql)
+        cnt = int(cur.fetchone()["cnt"])
+
+    if cnt > 0:
+        logger.warning(
+            "Default partition analytics.fact_orders_default contains %d rows; check partition maintenance.",
+            cnt,
+        )
+    else:
+        logger.info("Default partition analytics.fact_orders_default is empty")
+    return cnt
+
+
 # ---------------------------------------------------------------------------
 # Full transform orchestrator
 # ---------------------------------------------------------------------------
@@ -626,5 +651,6 @@ def run_all_transforms() -> dict[str, int]:
     results["fact_payments"]  = transform_fact_payments()
     results["fact_returns"]   = transform_fact_returns()
     results["agg_revenue"]    = transform_agg_revenue()
+    results["fact_orders_default_rows"] = check_default_partition_usage()
     results["materialized_views_refreshed"] = refresh_dashboard_materialized_views()
     return results
