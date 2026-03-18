@@ -44,6 +44,12 @@ class TestCustomersCleaner:
         cleaned = clean("customers", df)
         assert cleaned.loc[0, "customer_segment"] == "Vip"
 
+    def test_invalid_signup_date_becomes_null(self, valid_customers_df):
+        df = valid_customers_df.copy()
+        df.loc[0, "signup_date"] = "not-a-date"
+        cleaned = clean("customers", df)
+        assert pd.isna(cleaned.loc[0, "signup_date"])
+
 
 # ---------------------------------------------------------------------------
 # Products
@@ -109,6 +115,12 @@ class TestInventoryCleaner:
     def test_quantity_on_hand_is_int(self, valid_inventory_df):
         cleaned = clean("inventory", valid_inventory_df)
         assert isinstance(int(cleaned.loc[0, "quantity_on_hand"]), int)
+
+    def test_invalid_restock_date_becomes_null(self, valid_inventory_df):
+        df = valid_inventory_df.copy()
+        df.loc[0, "last_restock_date"] = "invalid-date"
+        cleaned = clean("inventory", df)
+        assert pd.isna(cleaned.loc[0, "last_restock_date"])
 
 
 # ---------------------------------------------------------------------------

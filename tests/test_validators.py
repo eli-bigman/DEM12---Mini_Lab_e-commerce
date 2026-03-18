@@ -103,9 +103,16 @@ class TestOrdersValidator:
         assert len(valid) == 1
         assert len(invalid) == 0
 
-    def test_invalid_status_quarantined(self, valid_orders_df):
+    def test_pending_status_is_allowed(self, valid_orders_df):
         df = valid_orders_df.copy()
         df.loc[0, "order_status"] = "Pending"
+        valid, invalid = validate("orders", df)
+        assert len(valid) == 1
+        assert len(invalid) == 0
+
+    def test_invalid_status_quarantined(self, valid_orders_df):
+        df = valid_orders_df.copy()
+        df.loc[0, "order_status"] = "InProgress"
         valid, invalid = validate("orders", df)
         assert len(invalid) == 1
 

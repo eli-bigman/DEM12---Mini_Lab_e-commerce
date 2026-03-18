@@ -5,11 +5,12 @@
 -- ============================================================
 SET search_path TO analytics;
 -- ------------------------------------------------------------
--- v_kpi_summary:  Single-row executive KPI snapshot
+-- mv_kpi_summary (materialized) + v_kpi_summary (wrapper view)
 -- Used for: Total Revenue, Total Orders, AOV, Gross Profit,
 --           Customer Growth Rate cards
 -- ------------------------------------------------------------
-CREATE OR REPLACE VIEW analytics.v_kpi_summary AS WITH current_period AS (
+DROP MATERIALIZED VIEW IF EXISTS analytics.mv_kpi_summary;
+CREATE MATERIALIZED VIEW analytics.mv_kpi_summary AS WITH current_period AS (
         SELECT COALESCE(SUM(revenue), 0) AS total_revenue,
             COALESCE(SUM(profit), 0) AS total_profit,
             COUNT(DISTINCT order_id) AS total_orders,
@@ -48,11 +49,14 @@ SELECT cp.total_revenue,
 FROM current_period cp
     CROSS JOIN last_month_customers lm
     CROSS JOIN prior_month_customers pm;
+CREATE OR REPLACE VIEW analytics.v_kpi_summary AS
+SELECT * FROM analytics.mv_kpi_summary;
 -- ------------------------------------------------------------
--- v_revenue_trend_daily: Revenue and profit by calendar day
+-- mv_revenue_trend_daily (materialized) + v_revenue_trend_daily (wrapper)
 -- Used for: Revenue Trend Over Time (line chart)
 -- ------------------------------------------------------------
-CREATE OR REPLACE VIEW analytics.v_revenue_trend_daily AS
+DROP MATERIALIZED VIEW IF EXISTS analytics.mv_revenue_trend_daily;
+CREATE MATERIALIZED VIEW analytics.mv_revenue_trend_daily AS
 SELECT dd.full_date AS date,
     dd.year,
     dd.month_number,
@@ -69,11 +73,16 @@ GROUP BY dd.full_date,
     dd.month_number,
     dd.month_name
 ORDER BY dd.full_date;
+CREATE INDEX IF NOT EXISTS idx_mv_revenue_trend_daily_date
+    ON analytics.mv_revenue_trend_daily(date);
+CREATE OR REPLACE VIEW analytics.v_revenue_trend_daily AS
+SELECT * FROM analytics.mv_revenue_trend_daily;
 -- ------------------------------------------------------------
--- v_revenue_by_category: Revenue aggregated by product category
+-- mv_revenue_by_category (materialized) + v_revenue_by_category (wrapper)
 -- Used for: Revenue by Category (bar / pie chart)
 -- ------------------------------------------------------------
-CREATE OR REPLACE VIEW analytics.v_revenue_by_category AS
+DROP MATERIALIZED VIEW IF EXISTS analytics.mv_revenue_by_category;
+CREATE MATERIALIZED VIEW analytics.mv_revenue_by_category AS
 SELECT dp.category,
     COALESCE(SUM(fo.revenue), 0) AS total_revenue,
     COALESCE(SUM(fo.profit), 0) AS total_profit,
@@ -87,11 +96,16 @@ FROM analytics.fact_orders fo
 WHERE fo.order_status = 'Completed'
 GROUP BY dp.category
 ORDER BY total_revenue DESC;
+CREATE INDEX IF NOT EXISTS idx_mv_revenue_by_category_name
+    ON analytics.mv_revenue_by_category(category);
+CREATE OR REPLACE VIEW analytics.v_revenue_by_category AS
+SELECT * FROM analytics.mv_revenue_by_category;
 -- ------------------------------------------------------------
--- v_revenue_by_channel: Revenue by customer acquisition channel
+-- mv_revenue_by_channel (materialized) + v_revenue_by_channel (wrapper)
 -- Used for: Revenue by Acquisition Channel (bar chart)
 -- ------------------------------------------------------------
-CREATE OR REPLACE VIEW analytics.v_revenue_by_channel AS
+DROP MATERIALIZED VIEW IF EXISTS analytics.mv_revenue_by_channel;
+CREATE MATERIALIZED VIEW analytics.mv_revenue_by_channel AS
 SELECT dc.acquisition_channel,
     COALESCE(SUM(fo.revenue), 0) AS total_revenue,
     COUNT(DISTINCT fo.order_id) AS total_orders,
@@ -105,11 +119,16 @@ FROM analytics.fact_orders fo
 WHERE fo.order_status = 'Completed'
 GROUP BY dc.acquisition_channel
 ORDER BY total_revenue DESC;
+CREATE INDEX IF NOT EXISTS idx_mv_revenue_by_channel_name
+    ON analytics.mv_revenue_by_channel(acquisition_channel);
+CREATE OR REPLACE VIEW analytics.v_revenue_by_channel AS
+SELECT * FROM analytics.mv_revenue_by_channel;
 -- ------------------------------------------------------------
--- v_top_products_profit: Top 10 products by total profit
+-- mv_top_products_profit (materialized) + v_top_products_profit (wrapper)
 -- Used for: Top 10 Products by Profit (table / bar chart)
 -- ------------------------------------------------------------
-CREATE OR REPLACE VIEW analytics.v_top_products_profit AS
+DROP MATERIALIZED VIEW IF EXISTS analytics.mv_top_products_profit;
+CREATE MATERIALIZED VIEW analytics.mv_top_products_profit AS
 SELECT dp.product_name,
     dp.category,
     COALESCE(SUM(fo.profit), 0) AS total_profit,
@@ -122,11 +141,16 @@ GROUP BY dp.product_name,
     dp.category
 ORDER BY total_profit DESC
 LIMIT 10;
+CREATE INDEX IF NOT EXISTS idx_mv_top_products_profit_name
+    ON analytics.mv_top_products_profit(product_name);
+CREATE OR REPLACE VIEW analytics.v_top_products_profit AS
+SELECT * FROM analytics.mv_top_products_profit;
 -- ------------------------------------------------------------
--- v_customer_retention: Segment order volume breakdown
+-- mv_customer_retention (materialized) + v_customer_retention (wrapper)
 -- Used for: Customer Retention Indicators (pie / bar chart)
 -- ------------------------------------------------------------
-CREATE OR REPLACE VIEW analytics.v_customer_retention AS
+DROP MATERIALIZED VIEW IF EXISTS analytics.mv_customer_retention;
+CREATE MATERIALIZED VIEW analytics.mv_customer_retention AS
 SELECT dc.customer_segment,
     COUNT(DISTINCT fo.order_id) AS total_orders,
     COUNT(DISTINCT fo.customer_sk) AS unique_customers,
@@ -139,9 +163,14 @@ FROM analytics.fact_orders fo
     JOIN analytics.dim_customers dc ON dc.customer_sk = fo.customer_sk
 GROUP BY dc.customer_segment
 ORDER BY total_orders DESC;
+CREATE INDEX IF NOT EXISTS idx_mv_customer_retention_segment
+    ON analytics.mv_customer_retention(customer_segment);
+CREATE OR REPLACE VIEW analytics.v_customer_retention AS
+SELECT * FROM analytics.mv_customer_retention;
 -- ------------------------------------------------------------
 -- v_order_status_distribution: Order counts by status
 -- Used for: Order Status Distribution (donut / bar chart)
+-- Kept as a regular view for immediate freshness (low query cost).
 -- ------------------------------------------------------------
 CREATE OR REPLACE VIEW analytics.v_order_status_distribution AS
 SELECT order_status,

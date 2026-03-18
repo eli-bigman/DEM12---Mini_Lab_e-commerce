@@ -37,8 +37,9 @@ def _to_utc_ts(series: pd.Series) -> pd.Series:
 
 
 def _to_date(series: pd.Series) -> pd.Series:
-    """Parse a series to date strings (YYYY-MM-DD), coercing errors to None."""
-    return pd.to_datetime(series, errors="coerce").dt.date.astype(str)
+    """Parse a series to Python date objects, coercing errors to None."""
+    parsed = pd.to_datetime(series, errors="coerce")
+    return parsed.dt.date.where(parsed.notna(), None)
 
 
 def _to_numeric(series: pd.Series, decimals: int = 2) -> pd.Series:

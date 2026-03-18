@@ -84,8 +84,9 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # All init scripts in this folder run automatically on first DB creation,
-      # including 05_seed_three_months.sql for dashboard bootstrap data.
+      # Init scripts (01-04) run automatically on first DB creation.
+      # 05_seed_three_months.sql moved to postgres/seed_data.sql for on-demand use.
+      # Load seed data manually via:  make seed
       - ./postgres/init:/docker-entrypoint-initdb.d
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
@@ -108,7 +109,10 @@ services:
       - bash
       - -c
       - >-
-        airflow db migrate && airflow users create --username "$${AIRFLOW_ADMIN_USERNAME}" --password "$${AIRFLOW_ADMIN_PASSWORD}" --firstname Admin --lastname User --role Admin --email "$${AIRFLOW_ADMIN_EMAIL}" || true
+        airflow db migrate &&
+        airflow users create --username "$${AIRFLOW_ADMIN_USERNAME}" --password "$${AIRFLOW_ADMIN_PASSWORD}" --firstname Admin --lastname User --role Admin --email "$${AIRFLOW_ADMIN_EMAIL}" || true &&
+        airflow dags unpause ecommerce_pipeline || true &&
+        airflow dags pause platform_health_check || true
     env_file:
       - .env
     environment:
@@ -117,9 +121,14 @@ services:
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
       AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME}
       AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
       AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - airflow_plugins:/opt/airflow/plugins
     depends_on:
       postgres:
         condition: service_healthy
@@ -158,6 +167,8 @@ services:
       - "8080:8080"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
+      - ./tests:/opt/airflow/tests
+      - ./requirements-dev.txt:/opt/airflow/requirements-dev.txt:ro
       - airflow_logs:/opt/airflow/logs
       - airflow_plugins:/opt/airflow/plugins
     healthcheck:
@@ -204,6 +215,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
+      - ./tests:/opt/airflow/tests
+      - ./requirements-dev.txt:/opt/airflow/requirements-dev.txt:ro
       - airflow_logs:/opt/airflow/logs
       - airflow_plugins:/opt/airflow/plugins
     healthcheck:
