@@ -547,6 +547,67 @@ def transform_agg_revenue() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Dashboard materialized views (refresh after transforms)
+# ---------------------------------------------------------------------------
+
+def refresh_dashboard_materialized_views() -> int:
+    """
+    Refresh expensive dashboard materialized views after facts/dimensions update.
+    Only refreshes views that exist, so this is safe across environments.
+    """
+    matviews = [
+        "mv_kpi_summary",
+        "mv_revenue_trend_daily",
+        "mv_revenue_by_category",
+        "mv_revenue_by_channel",
+        "mv_top_products_profit",
+        "mv_customer_retention",
+    ]
+
+    sql_count = """
+        SELECT COUNT(*) AS cnt
+        FROM pg_matviews
+        WHERE schemaname = 'analytics'
+          AND matviewname = ANY(%s)
+    """
+
+    sql_refresh = """
+        DO $$
+        DECLARE
+            mv_name TEXT;
+            target_views TEXT[] := ARRAY[
+                'mv_kpi_summary',
+                'mv_revenue_trend_daily',
+                'mv_revenue_by_category',
+                'mv_revenue_by_channel',
+                'mv_top_products_profit',
+                'mv_customer_retention'
+            ];
+        BEGIN
+            FOREACH mv_name IN ARRAY target_views LOOP
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_matviews
+                    WHERE schemaname = 'analytics'
+                      AND matviewname = mv_name
+                ) THEN
+                    EXECUTE format('REFRESH MATERIALIZED VIEW analytics.%I', mv_name);
+                END IF;
+            END LOOP;
+        END;
+        $$;
+    """
+
+    with transaction() as cur:
+        cur.execute(sql_count, (matviews,))
+        count = int(cur.fetchone()["cnt"])
+        cur.execute(sql_refresh)
+
+    logger.info("Refreshed %d analytics materialized views", count)
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Full transform orchestrator
 # ---------------------------------------------------------------------------
 
@@ -568,4 +629,5 @@ def run_all_transforms() -> dict[str, int]:
     results["fact_payments"]  = transform_fact_payments()
     results["fact_returns"]   = transform_fact_returns()
     results["agg_revenue"]    = transform_agg_revenue()
+    results["materialized_views_refreshed"] = refresh_dashboard_materialized_views()
     return results

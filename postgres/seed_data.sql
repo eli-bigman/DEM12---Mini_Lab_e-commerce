@@ -1,7 +1,14 @@
 -- ============================================================
--- 05_seed_three_months.sql
--- Bootstrap rich analytics demo data for the most recent ~3 months.
--- This script runs once when the Postgres volume is initialized.
+-- seed_data.sql
+-- Bootstrap 3 months of demo analytics data (optional).
+-- 
+-- This is NOT auto-executed on container startup.
+-- Run manually via: make seed
+--
+-- Safe to run alongside the pipeline:
+--   - Uses ON CONFLICT DO NOTHING (idempotent)
+--   - Inserts only into analytics schema (pipeline uses staging -> transform)
+--   - Different UUIDs than pipeline-generated data (no collision)
 -- ============================================================
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";

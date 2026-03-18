@@ -8,6 +8,7 @@
 .PHONY: help up down restart build logs ps \
 	init-db dashboard-metabase \
         trigger-dag dag-logs \
+        seed seed-force \
         test test-unit test-dag \
         clean nuke
 
@@ -32,6 +33,8 @@ help:
 	@echo "  make psql           Open a psql shell into ecommerce DB"
 	@echo "  make show-tables    List all staging and analytics tables"
 	@echo "  make row-counts     Show row counts for key analytics tables"
+	@echo "  make seed           Load 3-month demo seed data (once DB is ready)"
+	@echo "  make seed-force     Reload seed data (idempotent, safe during pipeline)"
 	@echo ""
 	@echo "  Pipeline"
 	@echo "  make trigger        Trigger the ecommerce_pipeline DAG manually"
@@ -118,6 +121,16 @@ row-counts:
 		SELECT 'analytics.agg_revenue',              COUNT(*) FROM analytics.agg_revenue \
 		ORDER BY 1;"
 
+seed:
+	@echo "Loading 3-month demo seed data..."
+	docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce < postgres/seed_data.sql
+	@echo "Seed data loaded successfully. Run 'make row-counts' to verify."
+
+seed-force:
+	@echo "Force-reloading seed data (idempotent)..."
+	docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce < postgres/seed_data.sql
+	@echo "Done. Safe to run while pipeline is active."
+
 # ============================================================
 # Pipeline
 # ============================================================
@@ -149,8 +162,10 @@ dashboard-metabase:
 # ============================================================
 
 test:
-	pip install -q -r requirements-dev.txt
-	python -m pytest tests/test_validators.py tests/test_cleaners.py -v
+	docker compose run --rm -T \
+		-v ./:/workspace -w /workspace \
+		airflow-webserver \
+		bash -lc "pip install -q -r requirements-dev.txt && python -m pytest tests/test_validators.py tests/test_cleaners.py -v"
 
 # ============================================================
 # Cleanup
