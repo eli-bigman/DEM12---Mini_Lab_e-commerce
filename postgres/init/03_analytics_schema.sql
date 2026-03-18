@@ -185,6 +185,67 @@ CREATE TABLE IF NOT EXISTS analytics.fact_returns (
 CREATE INDEX IF NOT EXISTS idx_fr_order ON analytics.fact_returns(order_id);
 CREATE INDEX IF NOT EXISTS idx_fr_date ON analytics.fact_returns(date_key);
 -- ------------------------------------------------------------
+-- Referential constraints (introduced as NOT VALID)
+-- ------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_fact_orders_customer_sk'
+    ) THEN
+        ALTER TABLE analytics.fact_orders
+        ADD CONSTRAINT fk_fact_orders_customer_sk
+        FOREIGN KEY (customer_sk)
+        REFERENCES analytics.dim_customers(customer_sk)
+        NOT VALID;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_fact_orders_product_sk'
+    ) THEN
+        ALTER TABLE analytics.fact_orders
+        ADD CONSTRAINT fk_fact_orders_product_sk
+        FOREIGN KEY (product_sk)
+        REFERENCES analytics.dim_products(product_sk)
+        NOT VALID;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_fact_orders_date_key'
+    ) THEN
+        ALTER TABLE analytics.fact_orders
+        ADD CONSTRAINT fk_fact_orders_date_key
+        FOREIGN KEY (date_key)
+        REFERENCES analytics.dim_date(date_key)
+        NOT VALID;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_fact_payments_date_key'
+    ) THEN
+        ALTER TABLE analytics.fact_payments
+        ADD CONSTRAINT fk_fact_payments_date_key
+        FOREIGN KEY (date_key)
+        REFERENCES analytics.dim_date(date_key)
+        NOT VALID;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_fact_returns_date_key'
+    ) THEN
+        ALTER TABLE analytics.fact_returns
+        ADD CONSTRAINT fk_fact_returns_date_key
+        FOREIGN KEY (date_key)
+        REFERENCES analytics.dim_date(date_key)
+        NOT VALID;
+    END IF;
+END;
+$$;
+-- ------------------------------------------------------------
 -- agg_revenue: daily aggregated revenue summary
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS analytics.agg_revenue (

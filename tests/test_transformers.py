@@ -96,3 +96,33 @@ class TestDefaultPartitionUsage:
         result = transformers.check_default_partition_usage()
 
         assert result == 0
+
+
+class TestReferentialIntegrityRoutines:
+    def test_cleanup_orphaned_foreign_keys_executes_all_cleanup_updates(self, monkeypatch):
+        cur = _FakeCursor()
+        cur.rowcount = 0
+        monkeypatch.setattr(transformers, "transaction", lambda: _fake_transaction(cur))
+
+        result = transformers.cleanup_orphaned_foreign_keys()
+
+        assert result == 0
+        assert len(cur.calls) == 5
+        sql_text = "\n".join(call[0] for call in cur.calls)
+        assert "UPDATE analytics.fact_orders fo" in sql_text
+        assert "UPDATE analytics.fact_payments fp" in sql_text
+        assert "UPDATE analytics.fact_returns fr" in sql_text
+
+    def test_validate_referential_constraints_executes_all_validations(self, monkeypatch):
+        cur = _FakeCursor()
+        monkeypatch.setattr(transformers, "transaction", lambda: _fake_transaction(cur))
+
+        result = transformers.validate_referential_constraints()
+
+        assert result == 5
+        sql_text = "\n".join(call[0] for call in cur.calls)
+        assert "VALIDATE CONSTRAINT fk_fact_orders_customer_sk" in sql_text
+        assert "VALIDATE CONSTRAINT fk_fact_orders_product_sk" in sql_text
+        assert "VALIDATE CONSTRAINT fk_fact_orders_date_key" in sql_text
+        assert "VALIDATE CONSTRAINT fk_fact_payments_date_key" in sql_text
+        assert "VALIDATE CONSTRAINT fk_fact_returns_date_key" in sql_text
