@@ -56,8 +56,8 @@ class TestUtilsImports:
 
 
 class TestDagStructure:
-    def test_ecommerce_pipeline_has_seven_entity_tasks(self):
-        """The pipeline DAG must declare one ingest task per entity."""
+    def test_ecommerce_pipeline_has_modular_structure(self):
+        """The pipeline DAG must have modular task groups for ingest, transform, and quality checks."""
         import ecommerce_pipeline
         from airflow.models import DagBag
 
@@ -67,14 +67,45 @@ class TestDagStructure:
         assert dag is not None, "ecommerce_pipeline DAG not found in DagBag"
 
         task_ids = {t.task_id for t in dag.tasks}
-        expected_tasks = {
+        
+        # Check for ingest TaskGroups (one per entity)
+        ingest_groups = {
             "ingest_customers", "ingest_products", "ingest_orders",
-            "ingest_payments", "ingest_inventory", "ingest_revenue",
-            "ingest_returns", "transform_to_analytics",
+            "ingest_payments", "ingest_inventory", "ingest_revenue", "ingest_returns"
         }
-        assert expected_tasks.issubset(task_ids), (
-            f"Missing tasks: {expected_tasks - task_ids}"
-        )
+        for entity in ingest_groups:
+            assert entity in task_ids or any(t.startswith(f"{entity}.") for t in task_ids), (
+                f"Missing ingest group for {entity}"
+            )
+        
+        # Check for transform TaskGroup with separate per-table tasks
+        transform_tasks = {
+            "bootstrap_analytics_schema",
+            "transform_dim_customers",
+            "transform_dim_products",
+            "transform_dim_inventory",
+            "transform_fact_orders",
+            "transform_fact_payments",
+            "transform_fact_returns",
+            "transform_agg_revenue",
+        }
+        for task in transform_tasks:
+            # Allow for TaskGroup prefixing (e.g., "transform.bootstrap_analytics_schema")
+            assert task in task_ids or any(t.endswith(f".{task}") for t in task_ids), (
+                f"Missing transform task {task}"
+            )
+        
+        # Check for post-transform quality TaskGroup
+        quality_tasks = {
+            "cleanup_orphaned_fks",
+            "validate_referential_integrity",
+            "check_default_partition",
+            "refresh_dashboard_views",
+        }
+        for task in quality_tasks:
+            assert task in task_ids or any(t.endswith(f".{task}") for t in task_ids), (
+                f"Missing quality task {task}"
+            )
 
     def test_ecommerce_pipeline_schedule(self):
         """Pipeline must be scheduled hourly."""

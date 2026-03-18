@@ -113,16 +113,19 @@ class TestReferentialIntegrityRoutines:
         assert "UPDATE analytics.fact_payments fp" in sql_text
         assert "UPDATE analytics.fact_returns fr" in sql_text
 
-    def test_validate_referential_constraints_executes_all_validations(self, monkeypatch):
+    def test_validate_referential_constraints_skips_partitioned_tables(self, monkeypatch):
         cur = _FakeCursor()
         monkeypatch.setattr(transformers, "transaction", lambda: _fake_transaction(cur))
 
         result = transformers.validate_referential_constraints()
 
-        assert result == 5
+        # Should only validate non-partitioned tables (payments, returns)
+        # Skips fact_orders FK validation due to Postgres partitioned table limitation
         sql_text = "\n".join(call[0] for call in cur.calls)
-        assert "VALIDATE CONSTRAINT fk_fact_orders_customer_sk" in sql_text
-        assert "VALIDATE CONSTRAINT fk_fact_orders_product_sk" in sql_text
-        assert "VALIDATE CONSTRAINT fk_fact_orders_date_key" in sql_text
         assert "VALIDATE CONSTRAINT fk_fact_payments_date_key" in sql_text
         assert "VALIDATE CONSTRAINT fk_fact_returns_date_key" in sql_text
+        # Asserts that fact_orders FKs are NOT validated
+        assert "fk_fact_orders_customer_sk" not in sql_text
+        assert "fk_fact_orders_product_sk" not in sql_text
+        assert "fk_fact_orders_date_key" not in sql_text
+        assert result == 2  # Only 2 constraints validated (payments + returns)
