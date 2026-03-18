@@ -141,6 +141,66 @@ def ensure_analytics_schema() -> None:
         CREATE INDEX IF NOT EXISTS idx_fr_date
             ON analytics.fact_returns(date_key);
 
+        -- Referential constraints (added as NOT VALID, validated after cleanup)
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'fk_fact_orders_customer_sk'
+            ) THEN
+                ALTER TABLE analytics.fact_orders
+                ADD CONSTRAINT fk_fact_orders_customer_sk
+                FOREIGN KEY (customer_sk)
+                REFERENCES analytics.dim_customers(customer_sk)
+                NOT VALID;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'fk_fact_orders_product_sk'
+            ) THEN
+                ALTER TABLE analytics.fact_orders
+                ADD CONSTRAINT fk_fact_orders_product_sk
+                FOREIGN KEY (product_sk)
+                REFERENCES analytics.dim_products(product_sk)
+                NOT VALID;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'fk_fact_orders_date_key'
+            ) THEN
+                ALTER TABLE analytics.fact_orders
+                ADD CONSTRAINT fk_fact_orders_date_key
+                FOREIGN KEY (date_key)
+                REFERENCES analytics.dim_date(date_key)
+                NOT VALID;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'fk_fact_payments_date_key'
+            ) THEN
+                ALTER TABLE analytics.fact_payments
+                ADD CONSTRAINT fk_fact_payments_date_key
+                FOREIGN KEY (date_key)
+                REFERENCES analytics.dim_date(date_key)
+                NOT VALID;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'fk_fact_returns_date_key'
+            ) THEN
+                ALTER TABLE analytics.fact_returns
+                ADD CONSTRAINT fk_fact_returns_date_key
+                FOREIGN KEY (date_key)
+                REFERENCES analytics.dim_date(date_key)
+                NOT VALID;
+            END IF;
+        END;
+        $$;
+
         -- agg_revenue
         CREATE TABLE IF NOT EXISTS analytics.agg_revenue (
             record_date   DATE PRIMARY KEY,
@@ -629,6 +689,92 @@ def check_default_partition_usage() -> int:
     return cnt
 
 
+def cleanup_orphaned_foreign_keys() -> int:
+    """Null out orphaned FK values so deferred constraint validation can succeed."""
+    sql_orders_customer = """
+        UPDATE analytics.fact_orders fo
+        SET customer_sk = NULL
+        WHERE customer_sk IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM analytics.dim_customers dc
+              WHERE dc.customer_sk = fo.customer_sk
+          )
+    """
+    sql_orders_product = """
+        UPDATE analytics.fact_orders fo
+        SET product_sk = NULL
+        WHERE product_sk IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM analytics.dim_products dp
+              WHERE dp.product_sk = fo.product_sk
+          )
+    """
+    sql_orders_date = """
+        UPDATE analytics.fact_orders fo
+        SET date_key = NULL
+        WHERE date_key IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM analytics.dim_date dd
+              WHERE dd.date_key = fo.date_key
+          )
+    """
+    sql_payments_date = """
+        UPDATE analytics.fact_payments fp
+        SET date_key = NULL
+        WHERE date_key IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM analytics.dim_date dd
+              WHERE dd.date_key = fp.date_key
+          )
+    """
+    sql_returns_date = """
+        UPDATE analytics.fact_returns fr
+        SET date_key = NULL
+        WHERE date_key IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM analytics.dim_date dd
+              WHERE dd.date_key = fr.date_key
+          )
+    """
+
+    with transaction() as cur:
+        cur.execute(sql_orders_customer)
+        n_orders_customer = cur.rowcount
+        cur.execute(sql_orders_product)
+        n_orders_product = cur.rowcount
+        cur.execute(sql_orders_date)
+        n_orders_date = cur.rowcount
+        cur.execute(sql_payments_date)
+        n_payments_date = cur.rowcount
+        cur.execute(sql_returns_date)
+        n_returns_date = cur.rowcount
+
+    total = n_orders_customer + n_orders_product + n_orders_date + n_payments_date + n_returns_date
+    logger.info("Cleaned %d orphaned FK references before constraint validation", total)
+    return total
+
+
+def validate_referential_constraints() -> int:
+    """Validate NOT VALID FKs after orphan cleanup; returns number validated."""
+    statements = [
+        "ALTER TABLE analytics.fact_orders VALIDATE CONSTRAINT fk_fact_orders_customer_sk",
+        "ALTER TABLE analytics.fact_orders VALIDATE CONSTRAINT fk_fact_orders_product_sk",
+        "ALTER TABLE analytics.fact_orders VALIDATE CONSTRAINT fk_fact_orders_date_key",
+        "ALTER TABLE analytics.fact_payments VALIDATE CONSTRAINT fk_fact_payments_date_key",
+        "ALTER TABLE analytics.fact_returns VALIDATE CONSTRAINT fk_fact_returns_date_key",
+    ]
+    with transaction() as cur:
+        for sql in statements:
+            cur.execute(sql)
+    logger.info("Validated %d referential constraints", len(statements))
+    return len(statements)
+
+
 # ---------------------------------------------------------------------------
 # Full transform orchestrator
 # ---------------------------------------------------------------------------
@@ -651,6 +797,8 @@ def run_all_transforms() -> dict[str, int]:
     results["fact_payments"]  = transform_fact_payments()
     results["fact_returns"]   = transform_fact_returns()
     results["agg_revenue"]    = transform_agg_revenue()
+    results["orphan_fks_cleaned"] = cleanup_orphaned_foreign_keys()
+    results["validated_constraints"] = validate_referential_constraints()
     results["fact_orders_default_rows"] = check_default_partition_usage()
     results["materialized_views_refreshed"] = refresh_dashboard_materialized_views()
     return results
