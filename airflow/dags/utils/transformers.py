@@ -74,6 +74,9 @@ def ensure_analytics_schema() -> None:
             ON analytics.dim_customers(customer_id);
         CREATE INDEX IF NOT EXISTS idx_dim_cust_current
             ON analytics.dim_customers(customer_id, is_current);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_cust_current_unique
+            ON analytics.dim_customers(customer_id)
+            WHERE is_current = TRUE;
 
         -- dim_products (SCD2)
         CREATE TABLE IF NOT EXISTS analytics.dim_products (
@@ -91,6 +94,9 @@ def ensure_analytics_schema() -> None:
             ON analytics.dim_products(product_id);
         CREATE INDEX IF NOT EXISTS idx_dim_prod_current
             ON analytics.dim_products(product_id, is_current);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_prod_current_unique
+            ON analytics.dim_products(product_id)
+            WHERE is_current = TRUE;
 
         -- dim_inventory (snapshot)
         CREATE TABLE IF NOT EXISTS analytics.dim_inventory (
