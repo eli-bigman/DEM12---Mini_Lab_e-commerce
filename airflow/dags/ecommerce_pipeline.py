@@ -22,31 +22,31 @@ CDC:
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
 from airflow.utils.task_group import TaskGroup
 
-from utils.cleaners import clean
-from utils.db_helper import file_already_processed, mark_file_processed
-from utils.loaders import load_to_staging
-from utils.minio_helper import get_client, list_objects, read_csv, send_to_quarantine
-from utils.transformers import (
+from tasks.ingest import (
+    clean_data,
+    discover_new_files,
+    load_to_staging_db,
+    validate_and_quarantine,
+)
+from tasks.transform import (
+    check_default_partition_usage,
+    cleanup_orphaned_foreign_keys,
     ensure_analytics_schema,
+    refresh_dashboard_materialized_views,
+    transform_agg_revenue,
     transform_dim_customers,
-    transform_dim_products,
     transform_dim_inventory,
+    transform_dim_products,
     transform_fact_orders,
     transform_fact_payments,
     transform_fact_returns,
-    transform_agg_revenue,
-    cleanup_orphaned_foreign_keys,
     validate_referential_constraints,
-    check_default_partition_usage,
-    refresh_dashboard_materialized_views,
 )
-from utils.validators import validate
 
 logger = logging.getLogger(__name__)
 
@@ -59,197 +59,6 @@ DEFAULT_ARGS = {
     "email_on_failure": False,
     "email_on_retry": False,
 }
-
-
-# ---------------------------------------------------------------------------
-# Granular ingest stage functions (separate discover, validate, clean, load)
-# ---------------------------------------------------------------------------
-
-def _discover_new_files(entity: str) -> dict:
-    """Discover new files in MinIO for this entity that haven't been processed."""
-    bucket = os.environ.get("MINIO_RAW_BUCKET", "raw-data")
-    client = get_client()
-
-    all_paths = list_objects(client, bucket, prefix=f"{entity}/")
-    new_paths = [p for p in all_paths if not file_already_processed(p)]
-
-    logger.info("Entity=%s: discovered %d new file(s) to process", entity, len(new_paths))
-    return {
-        "entity": entity,
-        "file_paths": new_paths,
-        "file_count": len(new_paths),
-    }
-
-
-def _validate_and_quarantine(entity: str, file_paths: list) -> dict:
-    """
-    Validate all files for the entity.
-    Separate schema + business rules validation.
-    Quarantine invalid rows to DLQ.
-    """
-    if not file_paths:
-        logger.info("Entity=%s: no files to validate", entity)
-        return {
-            "entity": entity,
-            "valid_rows": 0,
-            "invalid_rows": 0,
-            "quarantined_files": 0,
-        }
-
-    bucket = os.environ.get("MINIO_RAW_BUCKET", "raw-data")
-    client = get_client()
-
-    total_valid = 0
-    total_invalid = 0
-    quarantined_file_count = 0
-
-    for obj_path in file_paths:
-        file_invalid = 0
-        
-        for chunk_idx, df in enumerate(read_csv(client, bucket, obj_path)):
-            # VALIDATE: schema + business rules
-            valid_df, invalid_df = validate(entity, df)
-
-            # QUARANTINE: invalid rows to DLQ
-            if not invalid_df.empty:
-                send_to_quarantine(client, entity, obj_path, invalid_df, chunk_idx)
-                file_invalid += len(invalid_df)
-                quarantined_file_count += 1
-
-            total_valid += len(valid_df)
-            total_invalid += file_invalid
-
-    logger.info(
-        "Entity=%s validation complete: %d valid, %d invalid rows",
-        entity, total_valid, total_invalid
-    )
-    return {
-        "entity": entity,
-        "valid_rows": total_valid,
-        "invalid_rows": total_invalid,
-        "quarantined_files": quarantined_file_count,
-    }
-
-
-def _clean_data(entity: str, file_paths: list) -> dict:
-    """
-    Clean valid rows from files (type coercion, normalization).
-    Returns cleaned DataFrames in cache for next stage (load_to_staging).
-    """
-    if not file_paths:
-        logger.info("Entity=%s: no files to clean", entity)
-        return {
-            "entity": entity,
-            "cleaned_rows": 0,
-            "failed_files": 0,
-        }
-
-    bucket = os.environ.get("MINIO_RAW_BUCKET", "raw-data")
-    client = get_client()
-
-    total_cleaned = 0
-    failed_file_count = 0
-
-    for obj_path in file_paths:
-        try:
-            file_cleaned = 0
-            
-            for chunk_idx, df in enumerate(read_csv(client, bucket, obj_path)):
-                # VALIDATE: only process valid rows
-                valid_df, invalid_df = validate(entity, df)
-
-                # SKIP if nothing is valid
-                if valid_df.empty:
-                    continue
-
-                # CLEAN: type coercion, normalization (no DB writes yet)
-                clean_df = clean(entity, valid_df)
-                file_cleaned += len(clean_df)
-
-            if file_cleaned == 0:
-                logger.warning("File %s had no valid rows to clean", obj_path)
-            
-            total_cleaned += file_cleaned
-
-        except Exception as exc:
-            logger.error("Failed cleaning %s: %s", obj_path, exc, exc_info=True)
-            failed_file_count += 1
-
-    logger.info(
-        "Entity=%s cleaning complete: %d rows cleaned, %d files failed",
-        entity, total_cleaned, failed_file_count
-    )
-    return {
-        "entity": entity,
-        "cleaned_rows": total_cleaned,
-        "failed_files": failed_file_count,
-    }
-
-
-def _load_to_staging_db(entity: str, file_paths: list) -> dict:
-    """
-    Load cleaned rows from files into staging schema (UPSERT).
-    Marks files as processed upon success.
-    """
-    if not file_paths:
-        logger.info("Entity=%s: no files to load", entity)
-        return {
-            "entity": entity,
-            "loaded_rows": 0,
-            "failed_files": 0,
-        }
-
-    bucket = os.environ.get("MINIO_RAW_BUCKET", "raw-data")
-    client = get_client()
-
-    total_loaded = 0
-    failed_file_count = 0
-
-    for obj_path in file_paths:
-        try:
-            file_loaded = 0
-            
-            for chunk_idx, df in enumerate(read_csv(client, bucket, obj_path)):
-                # VALIDATE: only process valid rows
-                valid_df, invalid_df = validate(entity, df)
-
-                # SKIP if nothing is valid
-                if valid_df.empty:
-                    continue
-
-                # CLEAN: type coercion, normalization
-                clean_df = clean(entity, valid_df)
-
-                # LOAD: stage UPSERT
-                load_to_staging(entity, clean_df, source_file=obj_path)
-                file_loaded += len(clean_df)
-
-            if file_loaded == 0:
-                logger.warning("File %s had no valid rows to load", obj_path)
-            
-            total_loaded += file_loaded
-
-            # MARK: file as processed
-            mark_file_processed(
-                obj_path, entity,
-                row_count=file_loaded,
-                quarantine_count=0,
-                status="success" if file_loaded > 0 else "empty",
-            )
-
-        except Exception as exc:
-            logger.error("Failed loading %s: %s", obj_path, exc, exc_info=True)
-            failed_file_count += 1
-
-    logger.info(
-        "Entity=%s loading complete: %d rows loaded, %d files failed",
-        entity, total_loaded, failed_file_count
-    )
-    return {
-        "entity": entity,
-        "loaded_rows": total_loaded,
-        "failed_files": failed_file_count,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -280,24 +89,24 @@ def ecommerce_pipeline():
         with TaskGroup(group_id=f"ingest_{entity}") as tg_ingest:
             
             @task(task_id=f"discover_files_{entity}")
-            def discover_files() -> dict:
+            def discover_files(_entity: str = entity) -> dict:
                 """Discover new files in MinIO for this entity."""
-                return _discover_new_files(entity)
+                return discover_new_files(_entity)
 
             @task(task_id=f"validate_quarantine_{entity}")
-            def validate_quarantine(discover_result: dict) -> dict:
+            def validate_quarantine(discover_result: dict, _entity: str = entity) -> dict:
                 """Validate all discovered files and quarantine invalid rows."""
-                return _validate_and_quarantine(entity, discover_result["file_paths"])
+                return validate_and_quarantine(_entity, discover_result["file_paths"])
 
             @task(task_id=f"clean_{entity}")
-            def clean_files(discover_result: dict) -> dict:
+            def clean_files(discover_result: dict, _entity: str = entity) -> dict:
                 """Clean valid rows (type coercion, normalization)."""
-                return _clean_data(entity, discover_result["file_paths"])
+                return clean_data(_entity, discover_result["file_paths"])
 
             @task(task_id=f"load_{entity}")
-            def load_files(discover_result: dict) -> dict:
+            def load_files(discover_result: dict, _entity: str = entity) -> dict:
                 """Load cleaned rows into staging schema (UPSERT)."""
-                return _load_to_staging_db(entity, discover_result["file_paths"])
+                return load_to_staging_db(_entity, discover_result["file_paths"])
 
             # Within-entity dependencies: discover → validate → clean → load
             discover = discover_files()

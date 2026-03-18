@@ -9,10 +9,11 @@ for orders, payments, and returns.
 
 import os
 import sys
+import importlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "airflow", "dags"))
 
-from utils import loaders
+loaders = importlib.import_module("tasks.load.staging_loader")
 
 
 def _capture_execute_values(monkeypatch):

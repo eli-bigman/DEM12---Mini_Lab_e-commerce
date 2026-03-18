@@ -31,20 +31,20 @@ class TestDagImports:
 
 class TestUtilsImports:
     def test_validators_imports(self):
-        from utils import validators
-        assert hasattr(validators, "validate")
+        from tasks import validate
+        assert hasattr(validate, "validate")
 
     def test_cleaners_imports(self):
-        from utils import cleaners
-        assert hasattr(cleaners, "clean")
+        from tasks import clean
+        assert hasattr(clean, "clean")
 
     def test_loaders_imports(self):
-        from utils import loaders
-        assert hasattr(loaders, "load_to_staging")
+        from tasks import load
+        assert hasattr(load, "load_to_staging")
 
     def test_transformers_imports(self):
-        from utils import transformers
-        assert hasattr(transformers, "run_all_transforms")
+        from tasks import transform
+        assert hasattr(transform, "transform_fact_orders")
 
     def test_minio_helper_imports(self):
         from utils import minio_helper

@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "airflow", "dags"))
 
-from utils.validators import validate
+from tasks.validate import validate
 
 
 # ---------------------------------------------------------------------------
