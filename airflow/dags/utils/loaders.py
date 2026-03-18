@@ -93,6 +93,13 @@ def load_orders(df: pd.DataFrame, source_file: str) -> int:
              total_amount, order_timestamp, payment_method, order_status, _source_file)
         VALUES %s
         ON CONFLICT (order_id) DO UPDATE SET
+            customer_id     = EXCLUDED.customer_id,
+            product_id      = EXCLUDED.product_id,
+            quantity        = EXCLUDED.quantity,
+            unit_price      = EXCLUDED.unit_price,
+            total_amount    = EXCLUDED.total_amount,
+            order_timestamp = EXCLUDED.order_timestamp,
+            payment_method  = EXCLUDED.payment_method,
             order_status    = EXCLUDED.order_status,
             _loaded_at      = NOW(),
             _source_file    = EXCLUDED._source_file
@@ -118,6 +125,10 @@ def load_payments(df: pd.DataFrame, source_file: str) -> int:
              amount, payment_status, _source_file)
         VALUES %s
         ON CONFLICT (payment_id) DO UPDATE SET
+            order_id        = EXCLUDED.order_id,
+            payment_date    = EXCLUDED.payment_date,
+            payment_method  = EXCLUDED.payment_method,
+            amount          = EXCLUDED.amount,
             payment_status  = EXCLUDED.payment_status,
             _loaded_at      = NOW(),
             _source_file    = EXCLUDED._source_file
@@ -189,6 +200,10 @@ def load_returns(df: pd.DataFrame, source_file: str) -> int:
              refund_amount, return_status, _source_file)
         VALUES %s
         ON CONFLICT (return_id) DO UPDATE SET
+            order_id        = EXCLUDED.order_id,
+            return_date     = EXCLUDED.return_date,
+            return_reason   = EXCLUDED.return_reason,
+            refund_amount   = EXCLUDED.refund_amount,
             return_status   = EXCLUDED.return_status,
             _loaded_at      = NOW(),
             _source_file    = EXCLUDED._source_file

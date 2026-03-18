@@ -129,7 +129,7 @@ def validate_orders(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         v.expect_column_values_to_match_regex("total_amount", r"^\d+(\.\d+)?$")
         v.expect_column_values_to_match_regex("quantity", r"^\d+$")
         v.expect_column_values_to_be_in_set(
-            "order_status", ["Completed", "Cancelled", "Refunded"]
+            "order_status", ["Pending", "Completed", "Cancelled", "Refunded"]
         )
         v.expect_column_values_to_be_unique("order_id")
 
