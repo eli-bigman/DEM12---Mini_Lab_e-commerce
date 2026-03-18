@@ -43,3 +43,16 @@ class TestEnsureAnalyticsSchema:
         assert "WHERE is_current = TRUE" in ddl_sql
         assert "CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_prod_current_unique" in ddl_sql
         assert "ON analytics.dim_products(product_id)" in ddl_sql
+
+
+class TestDimInventoryTransform:
+    def test_no_global_zeroing_statement(self, monkeypatch):
+        cur = _FakeCursor()
+        monkeypatch.setattr(transformers, "transaction", lambda: _fake_transaction(cur))
+
+        transformers.transform_dim_inventory()
+
+        assert len(cur.calls) == 1
+        executed_sql = cur.calls[0][0]
+        assert "UPDATE analytics.dim_inventory" not in executed_sql
+        assert "INSERT INTO analytics.dim_inventory" in executed_sql

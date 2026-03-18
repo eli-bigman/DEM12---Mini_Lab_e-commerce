@@ -369,15 +369,7 @@ def transform_dim_products() -> int:
 # ---------------------------------------------------------------------------
 
 def transform_dim_inventory() -> int:
-    """Upsert staging.inventory into analytics.dim_inventory (current snapshot).
-    Zero-out missing inventory via pre-update.
-    """
-    sql_zero = """
-        UPDATE analytics.dim_inventory
-        SET quantity_on_hand = 0,
-            updated_at = NOW()
-        WHERE quantity_on_hand > 0
-    """
+    """Upsert staging.inventory into analytics.dim_inventory (current snapshot)."""
     sql = """
         INSERT INTO analytics.dim_inventory
             (inventory_id, product_id, warehouse_location,
@@ -396,7 +388,6 @@ def transform_dim_inventory() -> int:
             updated_at        = NOW()
     """
     with transaction() as cur:
-        cur.execute(sql_zero)
         cur.execute(sql)
         n = cur.rowcount
     logger.info("dim_inventory upserted %d rows", n)
