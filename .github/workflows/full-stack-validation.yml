@@ -53,8 +53,28 @@ jobs:
           sed -i "s|AIRFLOW__CORE__FERNET_KEY=.*|AIRFLOW__CORE__FERNET_KEY=${{ secrets.AIRFLOW__CORE__FERNET_KEY }}|g" .env
           sed -i "s|MB_DB_PASS=.*|MB_DB_PASS=${{ secrets.MB_DB_PASS }}|g" .env
 
-      - name: Start the full stack
-        run: docker compose up -d --build
+      - name: Start core services first
+        run: docker compose up -d --build postgres minio minio-init
+
+      - name: Wait for Postgres readiness
+        run: |
+          echo "Waiting for Postgres to accept connections..."
+          for i in $(seq 1 30); do
+            if docker exec ecommerce_postgres pg_isready -U ecommerce_user -d ecommerce; then
+              echo "Postgres is ready."
+              break
+            fi
+            echo "Postgres not ready yet (attempt $i/30). Retrying in 5s..."
+            sleep 5
+            if [ "$i" = "30" ]; then
+              echo "ERROR: Postgres did not become ready in time."
+              docker logs ecommerce_postgres 2>&1 | tail -100 || true
+              exit 1
+            fi
+          done
+
+      - name: Start dependent services
+        run: docker compose up -d --build airflow-init airflow-webserver airflow-scheduler collector metabase
 
       - name: Wait for Airflow webserver to be healthy
         run: |
@@ -74,9 +94,6 @@ jobs:
 
       - name: Verify database connection and analytics schema
         run: |
-          echo "Waiting for Postgres to be ready..."
-          docker exec ecommerce_postgres pg_isready -U ecommerce_user -d ecommerce
-
           echo "Polling for analytics.dim_date to be populated by init scripts..."
           for i in $(seq 1 30); do
             ROW_COUNT=$(docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce -t -q \
