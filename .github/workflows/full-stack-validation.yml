@@ -1,0 +1,191 @@
+name: Full Stack Validation
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "airflow/**"
+      - "collector/**"
+      - "postgres/**"
+      - "metabase/**"
+      - "tests/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - "requirements-dev.txt"
+      - ".github/workflows/full-stack-validation.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "airflow/**"
+      - "collector/**"
+      - "postgres/**"
+      - "metabase/**"
+      - "tests/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - "requirements-dev.txt"
+      - ".github/workflows/full-stack-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-stack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate Stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create .env from example
+        run: |
+          cp .env.example .env
+          sed -i "s|POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}|g" .env
+          sed -i "s|MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=${{ secrets.MINIO_ROOT_PASSWORD }}|g" .env
+          sed -i "s|AIRFLOW_ADMIN_PASSWORD=.*|AIRFLOW_ADMIN_PASSWORD=${{ secrets.AIRFLOW_ADMIN_PASSWORD }}|g" .env
+          sed -i "s|AIRFLOW_WEBSERVER_SECRET_KEY=.*|AIRFLOW_WEBSERVER_SECRET_KEY=${{ secrets.AIRFLOW_WEBSERVER_SECRET_KEY }}|g" .env
+          sed -i "s|AIRFLOW__CORE__FERNET_KEY=.*|AIRFLOW__CORE__FERNET_KEY=${{ secrets.AIRFLOW__CORE__FERNET_KEY }}|g" .env
+          sed -i "s|MB_DB_PASS=.*|MB_DB_PASS=${{ secrets.MB_DB_PASS }}|g" .env
+
+      - name: Start the full stack
+        run: docker compose up -d --build
+
+      - name: Wait for Airflow webserver to be healthy
+        run: |
+          echo "Polling Airflow health endpoint..."
+          for i in $(seq 1 40); do
+            STATUS=$(curl -sf http://localhost:8080/health 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); \
+                print(d.get('metadatabase',{}).get('status','unhealthy'))" 2>/dev/null \
+              || echo "unhealthy")
+            echo "Airflow status: $STATUS (attempt $i/40)"
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Airflow is ready."
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Verify database connection and analytics schema
+        run: |
+          echo "Waiting for Postgres to be ready..."
+          docker exec ecommerce_postgres pg_isready -U ecommerce_user -d ecommerce
+
+          echo "Polling for analytics.dim_date to be populated by init scripts..."
+          for i in $(seq 1 30); do
+            ROW_COUNT=$(docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce -t -q \
+              -c "SELECT COUNT(*) FROM information_schema.tables \
+                  WHERE table_schema = 'analytics' AND table_name = 'dim_date';" \
+              2>/dev/null | tr -d ' \n' || echo "0")
+            if [ "$ROW_COUNT" = "1" ]; then
+              echo "analytics.dim_date exists. Verifying row count..."
+              docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
+                -c "SELECT COUNT(*) AS dim_date_rows FROM analytics.dim_date;"
+              echo "Database schema verified successfully."
+              break
+            fi
+            echo "analytics.dim_date not ready yet (attempt $i/30). Retrying in 5s..."
+            sleep 5
+            if [ "$i" = "30" ]; then
+              echo "ERROR: analytics.dim_date was never created. Init script may have failed."
+              docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
+                -c "\\dn+" || true
+              exit 1
+            fi
+          done
+
+      - name: Wait for Collector to successfully upload data to MinIO
+        run: |
+          echo "Watching Collector logs for successful uploads..."
+          for i in $(seq 1 20); do
+            UPLOAD_COUNT=$(docker logs ecommerce_collector 2>&1 | grep -ci "upload" || true)
+            echo "Collector upload log lines: $UPLOAD_COUNT (attempt $i/20)"
+            if [ "$UPLOAD_COUNT" -gt "0" ]; then
+              echo "Collector has uploaded data to MinIO."
+              docker logs ecommerce_collector 2>&1 | tail -5
+              break
+            fi
+            sleep 15
+          done
+
+          FINAL_COUNT=$(docker logs ecommerce_collector 2>&1 | grep -ci "upload" || true)
+          if [ "$FINAL_COUNT" -eq "0" ]; then
+            echo "ERROR: Collector never uploaded data. Container logs:"
+            docker logs ecommerce_collector 2>&1
+            exit 1
+          fi
+
+      - name: Trigger the ecommerce pipeline DAG
+        run: |
+          echo "Waiting for DAG to be parsed by scheduler..."
+          for i in $(seq 1 30); do
+            if docker exec ecommerce_airflow_webserver airflow dags list | grep -q 'ecommerce_pipeline'; then
+              echo "DAG registered!"
+              break
+            fi
+            echo "Waiting 5s for DAG registration... (attempt $i/30)"
+            sleep 5
+            if [ "$i" = "30" ]; then
+              echo "ERROR: DAG never registered."
+              exit 1
+            fi
+          done
+
+          docker exec ecommerce_airflow_webserver \
+            airflow dags unpause ecommerce_pipeline
+          docker exec ecommerce_airflow_webserver \
+            airflow dags trigger ecommerce_pipeline
+
+      - name: Poll for DAG run completion
+        run: |
+          echo "Polling DAG run status..."
+          FINAL_STATUS="unknown"
+          for i in $(seq 1 30); do
+            sleep 60
+            FINAL_STATUS=$(docker exec ecommerce_airflow_webserver \
+              airflow dags list-runs -d ecommerce_pipeline \
+              --no-backfill -o json 2>/dev/null \
+              | python3 -c "import sys,json; runs=json.load(sys.stdin); \
+                print(runs[0]['state'] if runs else 'unknown')" \
+              || echo "unknown")
+            echo "DAG run status: $FINAL_STATUS (attempt $i/30)"
+            if [ "$FINAL_STATUS" = "success" ] || [ "$FINAL_STATUS" = "failed" ]; then
+              break
+            fi
+          done
+
+          if [ "$FINAL_STATUS" = "failed" ]; then
+            echo "FAIL: DAG run failed. Last task states:"
+            docker logs ecommerce_airflow_scheduler 2>&1 | tail -30
+            exit 1
+          fi
+
+      - name: Confirm fact_orders has rows
+        run: |
+          ROW_COUNT=$(docker exec ecommerce_postgres psql \
+            -U ecommerce_user -d ecommerce -t \
+            -c "SELECT COUNT(*) FROM analytics.fact_orders;" | tr -d ' \n')
+          echo "fact_orders rows: $ROW_COUNT"
+          if [ "$ROW_COUNT" -eq "0" ]; then
+            echo "FAIL: fact_orders is empty. Diagnostic staging counts:"
+            docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce \
+              -c "SELECT 'staging.orders'   AS t, COUNT(*) FROM staging.orders
+                  UNION ALL SELECT 'staging.customers', COUNT(*) FROM staging.customers
+                  UNION ALL SELECT 'processed_files',   COUNT(*) FROM staging.processed_files;"
+            echo "Last 20 Collector log lines:"
+            docker logs ecommerce_collector 2>&1 | tail -20
+            echo "Last 20 Airflow scheduler log lines:"
+            docker logs ecommerce_airflow_scheduler 2>&1 | tail -20
+            exit 1
+          fi
+          echo "PASS: fact_orders has $ROW_COUNT rows."
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v

@@ -1,0 +1,52 @@
+name: Collector CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "collector/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - "collector/requirements.txt"
+      - ".github/workflows/collector-ci.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "collector/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - "collector/requirements.txt"
+      - ".github/workflows/collector-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-collector:
+    name: Build Collector Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build collector image
+        run: docker build -t ecommerce-collector:ci ./collector
+
+  lint-collector:
+    name: Lint Collector (syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install collector dependencies
+        run: pip install -r collector/requirements.txt
+
+      - name: Check Python syntax
+        run: python -m compileall collector
