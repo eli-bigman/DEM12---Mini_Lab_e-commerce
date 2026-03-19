@@ -62,7 +62,8 @@ class TestDagStructure:
         from airflow.models import DagBag
 
         dag_bag = DagBag(dag_folder=DAGS_PATH, include_examples=False)
-        dag = dag_bag.get_dag("ecommerce_pipeline")
+        # Avoid DagBag.get_dag(), which queries Airflow metadata tables.
+        dag = dag_bag.dags.get("ecommerce_pipeline")
 
         assert dag is not None, "ecommerce_pipeline DAG not found in DagBag"
 
@@ -124,7 +125,8 @@ class TestDagStructure:
         """Pipeline must be scheduled hourly."""
         from airflow.models import DagBag
         dag_bag = DagBag(dag_folder=DAGS_PATH, include_examples=False)
-        dag = dag_bag.get_dag("ecommerce_pipeline")
+        # Access in-memory parsed DAG to keep test independent of metadata DB.
+        dag = dag_bag.dags.get("ecommerce_pipeline")
         assert dag is not None
         assert dag.schedule_interval in ("@hourly", "0 * * * *")
 

@@ -36,7 +36,7 @@ jobs:
           cache: "pip"
 
       - name: Install test dependencies
-        run: pip install -r requirements-dev.txt
+        run: pip install -r requirements-dev.txt -r airflow/requirements.txt
 
       - name: Run pytest suite
         run: pytest tests/ -v --tb=short
