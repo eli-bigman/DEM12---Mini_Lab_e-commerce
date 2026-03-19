@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "airflow", "dags"))
 
-from utils.cleaners import clean
+from tasks.clean import clean
 
 
 # ---------------------------------------------------------------------------

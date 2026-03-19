@@ -217,3 +217,29 @@ ON CONFLICT (record_date) DO UPDATE SET
     total_profit = EXCLUDED.total_profit,
     total_orders = EXCLUDED.total_orders,
     updated_at = NOW();
+
+-- 7) Keep dashboard materialized views in sync with freshly seeded analytics data
+DO $$
+DECLARE
+    mv_name TEXT;
+    target_views TEXT[] := ARRAY[
+        'mv_kpi_summary',
+        'mv_revenue_trend_daily',
+        'mv_revenue_by_category',
+        'mv_revenue_by_channel',
+        'mv_top_products_profit',
+        'mv_customer_retention'
+    ];
+BEGIN
+    FOREACH mv_name IN ARRAY target_views LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM pg_matviews
+            WHERE schemaname = 'analytics'
+              AND matviewname = mv_name
+        ) THEN
+            EXECUTE format('REFRESH MATERIALIZED VIEW analytics.%I', mv_name);
+        END IF;
+    END LOOP;
+END;
+$$;

@@ -1,0 +1,131 @@
+"""
+tests/test_transformers.py
+
+Focused unit tests for SQL behavior in airflow/dags/tasks/transform modules.
+"""
+
+import os
+import sys
+from contextlib import contextmanager
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "airflow", "dags"))
+
+from tasks.transform import bootstrap, dimensions, quality
+
+
+class _FakeCursor:
+    def __init__(self):
+        self.calls = []
+        self.rowcount = 0
+        self.fetchone_result = {"cnt": 0}
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+
+    def fetchone(self):
+        return self.fetchone_result
+
+
+@contextmanager
+def _fake_transaction(cursor):
+    yield cursor
+
+
+class TestEnsureAnalyticsSchema:
+    def test_bootstrap_creates_partial_unique_indexes_for_scd2(self, monkeypatch):
+        cur = _FakeCursor()
+        monkeypatch.setattr(bootstrap, "transaction", lambda: _fake_transaction(cur))
+
+        bootstrap.ensure_analytics_schema()
+
+        ddl_sql = cur.calls[0][0]
+        assert "CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_cust_current_unique" in ddl_sql
+        assert "ON analytics.dim_customers(customer_id)" in ddl_sql
+        assert "WHERE is_current = TRUE" in ddl_sql
+        assert "CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_prod_current_unique" in ddl_sql
+        assert "ON analytics.dim_products(product_id)" in ddl_sql
+
+    def test_bootstrap_uses_rolling_partition_and_date_windows(self, monkeypatch):
+        cur = _FakeCursor()
+        monkeypatch.setattr(bootstrap, "transaction", lambda: _fake_transaction(cur))
+
+        bootstrap.ensure_analytics_schema()
+
+        partition_sql = cur.calls[2][0]
+        assert "date_trunc('month', CURRENT_DATE - INTERVAL '12 months')" in partition_sql
+        assert "date_trunc('month', CURRENT_DATE + INTERVAL '24 months')" in partition_sql
+        assert "FOR y IN 2024..2026 LOOP" not in partition_sql
+
+        dim_date_sql = cur.calls[3][0]
+        assert "(CURRENT_DATE - INTERVAL '2 years')::DATE" in dim_date_sql
+        assert "(CURRENT_DATE + INTERVAL '2 years')::DATE" in dim_date_sql
+
+
+class TestDimInventoryTransform:
+    def test_no_global_zeroing_statement(self, monkeypatch):
+        cur = _FakeCursor()
+        monkeypatch.setattr(dimensions, "transaction", lambda: _fake_transaction(cur))
+
+        dimensions.transform_dim_inventory()
+
+        assert len(cur.calls) == 1
+        executed_sql = cur.calls[0][0]
+        assert "UPDATE analytics.dim_inventory" not in executed_sql
+        assert "INSERT INTO analytics.dim_inventory" in executed_sql
+
+
+class TestDefaultPartitionUsage:
+    def test_warns_when_default_partition_has_rows(self, monkeypatch):
+        cur = _FakeCursor()
+        cur.fetchone_result = {"cnt": 7}
+        monkeypatch.setattr(quality, "transaction", lambda: _fake_transaction(cur))
+
+        warnings = []
+        monkeypatch.setattr(quality.logger, "warning", lambda msg, cnt: warnings.append((msg, cnt)))
+
+        result = quality.check_default_partition_usage()
+
+        assert result == 7
+        assert warnings
+
+    def test_returns_zero_when_default_partition_empty(self, monkeypatch):
+        cur = _FakeCursor()
+        cur.fetchone_result = {"cnt": 0}
+        monkeypatch.setattr(quality, "transaction", lambda: _fake_transaction(cur))
+
+        result = quality.check_default_partition_usage()
+
+        assert result == 0
+
+
+class TestReferentialIntegrityRoutines:
+    def test_cleanup_orphaned_foreign_keys_executes_all_cleanup_updates(self, monkeypatch):
+        cur = _FakeCursor()
+        cur.rowcount = 0
+        monkeypatch.setattr(quality, "transaction", lambda: _fake_transaction(cur))
+
+        result = quality.cleanup_orphaned_foreign_keys()
+
+        assert result == 0
+        assert len(cur.calls) == 5
+        sql_text = "\n".join(call[0] for call in cur.calls)
+        assert "UPDATE analytics.fact_orders fo" in sql_text
+        assert "UPDATE analytics.fact_payments fp" in sql_text
+        assert "UPDATE analytics.fact_returns fr" in sql_text
+
+    def test_validate_referential_constraints_skips_partitioned_tables(self, monkeypatch):
+        cur = _FakeCursor()
+        monkeypatch.setattr(quality, "transaction", lambda: _fake_transaction(cur))
+
+        result = quality.validate_referential_constraints()
+
+        # Should only validate non-partitioned tables (payments, returns)
+        # Skips fact_orders FK validation due to Postgres partitioned table limitation
+        sql_text = "\n".join(call[0] for call in cur.calls)
+        assert "VALIDATE CONSTRAINT fk_fact_payments_date_key" in sql_text
+        assert "VALIDATE CONSTRAINT fk_fact_returns_date_key" in sql_text
+        # Asserts that fact_orders FKs are NOT validated
+        assert "fk_fact_orders_customer_sk" not in sql_text
+        assert "fk_fact_orders_product_sk" not in sql_text
+        assert "fk_fact_orders_date_key" not in sql_text
+        assert result == 2  # Only 2 constraints validated (payments + returns)

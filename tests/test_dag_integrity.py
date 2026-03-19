@@ -31,20 +31,20 @@ class TestDagImports:
 
 class TestUtilsImports:
     def test_validators_imports(self):
-        from utils import validators
-        assert hasattr(validators, "validate")
+        from tasks import validate
+        assert hasattr(validate, "validate")
 
     def test_cleaners_imports(self):
-        from utils import cleaners
-        assert hasattr(cleaners, "clean")
+        from tasks import clean
+        assert hasattr(clean, "clean")
 
     def test_loaders_imports(self):
-        from utils import loaders
-        assert hasattr(loaders, "load_to_staging")
+        from tasks import load
+        assert hasattr(load, "load_to_staging")
 
     def test_transformers_imports(self):
-        from utils import transformers
-        assert hasattr(transformers, "run_all_transforms")
+        from tasks import transform
+        assert hasattr(transform, "transform_fact_orders")
 
     def test_minio_helper_imports(self):
         from utils import minio_helper
@@ -56,8 +56,8 @@ class TestUtilsImports:
 
 
 class TestDagStructure:
-    def test_ecommerce_pipeline_has_seven_entity_tasks(self):
-        """The pipeline DAG must declare one ingest task per entity."""
+    def test_ecommerce_pipeline_has_modular_structure(self):
+        """The pipeline DAG must have modular task groups for ingest (discover/validate/clean/load), transform, and quality checks."""
         import ecommerce_pipeline
         from airflow.models import DagBag
 
@@ -67,14 +67,58 @@ class TestDagStructure:
         assert dag is not None, "ecommerce_pipeline DAG not found in DagBag"
 
         task_ids = {t.task_id for t in dag.tasks}
-        expected_tasks = {
-            "ingest_customers", "ingest_products", "ingest_orders",
-            "ingest_payments", "ingest_inventory", "ingest_revenue",
-            "ingest_returns", "transform_to_analytics",
+        task_ids_str = " | ".join(sorted(task_ids))
+        
+        # Check for granular ingest stages (discover, validate, clean, load per entity)
+        # Total: 7 entities × 4 stages = 28 ingest tasks
+        ingest_entities = [
+            "customers", "products", "orders",
+            "payments", "inventory", "revenue", "returns"
+        ]
+        for entity in ingest_entities:
+            discover = f"discover_files_{entity}"
+            validate = f"validate_quarantine_{entity}"
+            clean = f"clean_{entity}"
+            load = f"load_{entity}"
+            
+            # Tasks may be in TaskGroups, check for exact or prefixed names
+            has_discover = discover in task_ids or any(t.endswith(f".{discover}") for t in task_ids)
+            has_validate = validate in task_ids or any(t.endswith(f".{validate}") for t in task_ids)
+            has_clean = clean in task_ids or any(t.endswith(f".{clean}") for t in task_ids)
+            has_load = load in task_ids or any(t.endswith(f".{load}") for t in task_ids)
+            
+            assert has_discover, f"Missing {discover} in DAG tasks: {task_ids_str}"
+            assert has_validate, f"Missing {validate} in DAG tasks: {task_ids_str}"
+            assert has_clean, f"Missing {clean} in DAG tasks: {task_ids_str}"
+            assert has_load, f"Missing {load} in DAG tasks: {task_ids_str}"
+        
+        # Check for transform tasks
+        transform_tasks = {
+            "bootstrap_analytics_schema",
+            "transform_dim_customers",
+            "transform_dim_products",
+            "transform_dim_inventory",
+            "transform_fact_orders",
+            "transform_fact_payments",
+            "transform_fact_returns",
+            "transform_agg_revenue",
         }
-        assert expected_tasks.issubset(task_ids), (
-            f"Missing tasks: {expected_tasks - task_ids}"
-        )
+        for task in transform_tasks:
+            assert task in task_ids or any(t.endswith(f".{task}") for t in task_ids), (
+                f"Missing transform task {task} in: {task_ids_str}"
+            )
+        
+        # Check for quality tasks
+        quality_tasks = {
+            "cleanup_orphaned_fks",
+            "validate_referential_integrity",
+            "check_default_partition",
+            "refresh_dashboard_views",
+        }
+        for task in quality_tasks:
+            assert task in task_ids or any(t.endswith(f".{task}") for t in task_ids), (
+                f"Missing quality task {task} in: {task_ids_str}"
+            )
 
     def test_ecommerce_pipeline_schedule(self):
         """Pipeline must be scheduled hourly."""

@@ -123,12 +123,12 @@ row-counts:
 
 seed:
 	@echo "Loading 3-month demo seed data..."
-	docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce < postgres/seed_data.sql
+	powershell -Command "Get-Content postgres/seed_data.sql | docker exec -i ecommerce_postgres psql -U ecommerce_user -d ecommerce"
 	@echo "Seed data loaded successfully. Run 'make row-counts' to verify."
 
 seed-force:
 	@echo "Force-reloading seed data (idempotent)..."
-	docker exec ecommerce_postgres psql -U ecommerce_user -d ecommerce < postgres/seed_data.sql
+	powershell -Command "Get-Content postgres/seed_data.sql | docker exec -i ecommerce_postgres psql -U ecommerce_user -d ecommerce"
 	@echo "Done. Safe to run while pipeline is active."
 
 # ============================================================

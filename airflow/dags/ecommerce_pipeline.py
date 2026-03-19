@@ -1,46 +1,52 @@
 """
 dags/ecommerce_pipeline.py
 
-E-Commerce Data Pipeline DAG.
+E-Commerce Data Pipeline DAG — Modularized.
 
 Runs hourly (or on-demand) to process any new CSV files that the
 Collector service has uploaded to MinIO since the last run.
 
-Flow per entity:
-  1. Scan MinIO for files not yet recorded in staging.processed_files.
-  2. Read each file into a pandas DataFrame.
-  3. Validate with validators.validate() -> split into (valid, invalid).
-  4. Route invalid rows to the MinIO quarantine bucket (DLQ).
-  5. Clean valid rows with cleaners.clean().
-  6. UPSERT into the staging schema via loaders.load_to_staging().
-  7. Mark the file as processed in staging.processed_files.
-  8. After all entities are staged, transform into the analytics star schema.
+Modular design:
+  1. INGEST (per entity): discover → validate → quarantine → clean → load → mark processed
+  2. TRANSFORM (separate task per domain): dimensions → facts → aggregates → quality checks
 
 Idempotency:
   - staging.processed_files prevents re-processing the same files.
   - All staging inserts use ON CONFLICT DO UPDATE (UPSERT).
-  - analytics inserts use SCD2 / UPSERT / DELETE-then-INSERT patterns.
+  - analytics transforms use SCD2 / UPSERT / DELETE-then-INSERT patterns.
 
 CDC:
-  - order_status changes (Pending -> Refunded/Cancelled) are captured on
-    re-upload: the orders UPSERT updates order_status whenever a file with
-    the same order_id is loaded again.
+  - order_status changes are captured on re-upload via staging UPSERT behavior.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
+from airflow.utils.task_group import TaskGroup
 
-from utils.cleaners import clean
-from utils.db_helper import file_already_processed, mark_file_processed
-from utils.loaders import load_to_staging
-from utils.minio_helper import get_client, list_objects, read_csv, send_to_quarantine
-from utils.transformers import run_all_transforms
-from utils.validators import validate
+from tasks.ingest import (
+    clean_data,
+    discover_new_files,
+    load_to_staging_db,
+    validate_and_quarantine,
+)
+from tasks.transform import (
+    check_default_partition_usage,
+    cleanup_orphaned_foreign_keys,
+    ensure_analytics_schema,
+    refresh_dashboard_materialized_views,
+    transform_agg_revenue,
+    transform_dim_customers,
+    transform_dim_inventory,
+    transform_dim_products,
+    transform_fact_orders,
+    transform_fact_payments,
+    transform_fact_returns,
+    validate_referential_constraints,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,85 +62,12 @@ DEFAULT_ARGS = {
 
 
 # ---------------------------------------------------------------------------
-# Task implementations
-# ---------------------------------------------------------------------------
-
-def _process_entity(entity: str) -> dict:
-    """
-    Full ingest pipeline for a single entity:
-    scan → validate → quarantine invalids → clean → load staging → mark processed.
-
-    Returns a summary dict with counts for XCom.
-    """
-    bucket = os.environ.get("MINIO_RAW_BUCKET", "raw-data")
-    client = get_client()
-
-    all_paths = list_objects(client, bucket, prefix=f"{entity}/")
-    new_paths = [p for p in all_paths if not file_already_processed(p)]
-
-    logger.info("Entity=%s: %d new file(s) to process", entity, len(new_paths))
-
-    total_valid = 0
-    total_invalid = 0
-
-    for obj_path in new_paths:
-        try:
-            file_valid = 0
-            file_invalid = 0
-            
-            for chunk_idx, df in enumerate(read_csv(client, bucket, obj_path)):
-                # -- Validate --
-                valid_df, invalid_df = validate(entity, df)
-
-                # -- DLQ: quarantine invalid rows --
-                quarantine_count = 0
-                if not invalid_df.empty:
-                    send_to_quarantine(client, entity, obj_path, invalid_df, chunk_idx)
-                    quarantine_count = len(invalid_df)
-
-                # -- Skip entirely if nothing is valid in chunk --
-                if valid_df.empty:
-                    file_invalid += quarantine_count
-                    continue
-
-                # -- Clean --
-                clean_df = clean(entity, valid_df)
-
-                # -- Load to staging --
-                load_to_staging(entity, clean_df, source_file=obj_path)
-
-                file_valid += len(clean_df)
-                file_invalid += quarantine_count
-
-            # -- Mark as processed --
-            if file_valid == 0 and file_invalid == 0:
-                logger.warning("File %s was completely empty.", obj_path)
-                
-            status = "partial" if file_invalid > 0 else "success"
-            mark_file_processed(
-                obj_path, entity,
-                row_count=file_valid,
-                quarantine_count=file_invalid,
-                status=status,
-            )
-
-            total_valid += file_valid
-            total_invalid += file_invalid
-
-        except Exception as exc:
-            logger.error("Failed processing %s: %s", obj_path, exc, exc_info=True)
-            raise
-
-    return {"entity": entity, "valid": total_valid, "invalid": total_invalid, "files": len(new_paths)}
-
-
-# ---------------------------------------------------------------------------
-# DAG definition (TaskFlow API)
+# DAG definition (TaskFlow API with TaskGroups for modularity)
 # ---------------------------------------------------------------------------
 
 @dag(
     dag_id="ecommerce_pipeline",
-    description="Hourly pipeline: MinIO -> staging -> analytics star schema.",
+    description="Modularized pipeline: MinIO → staging (validate/clean/load) → analytics star schema.",
     schedule="@hourly",
     start_date=datetime(2024, 1, 1),
     catchup=False,
@@ -143,66 +76,161 @@ def _process_entity(entity: str) -> dict:
     tags=["platform", "pipeline"],
 )
 def ecommerce_pipeline():
-    """Main e-commerce data processing DAG."""
+    """Main e-commerce data processing DAG — modularized by stage."""
 
-    @task(task_id="ingest_customers")
-    def ingest_customers() -> dict:
-        return _process_entity("customers")
+    # =========================================================================
+    # INGEST STAGE: separate TaskGroup per entity with granular stages
+    #   discover → validate → quarantine → clean → load → mark processed
+    # =========================================================================
+    
+    ingest_tasks = {}
+    
+    for entity in ENTITIES:
+        with TaskGroup(group_id=f"ingest_{entity}") as tg_ingest:
+            
+            @task(task_id=f"discover_files_{entity}")
+            def discover_files(_entity: str = entity) -> dict:
+                """Discover new files in MinIO for this entity."""
+                return discover_new_files(_entity)
 
-    @task(task_id="ingest_products")
-    def ingest_products() -> dict:
-        return _process_entity("products")
+            @task(task_id=f"validate_quarantine_{entity}")
+            def validate_quarantine(discover_result: dict, _entity: str = entity) -> dict:
+                """Validate all discovered files and quarantine invalid rows."""
+                return validate_and_quarantine(_entity, discover_result["file_paths"])
 
-    @task(task_id="ingest_orders")
-    def ingest_orders() -> dict:
-        return _process_entity("orders")
+            @task(task_id=f"clean_{entity}")
+            def clean_files(discover_result: dict, _entity: str = entity) -> dict:
+                """Clean valid rows (type coercion, normalization)."""
+                return clean_data(_entity, discover_result["file_paths"])
 
-    @task(task_id="ingest_payments")
-    def ingest_payments() -> dict:
-        return _process_entity("payments")
+            @task(task_id=f"load_{entity}")
+            def load_files(discover_result: dict, _entity: str = entity) -> dict:
+                """Load cleaned rows into staging schema (UPSERT)."""
+                return load_to_staging_db(_entity, discover_result["file_paths"])
 
-    @task(task_id="ingest_inventory")
-    def ingest_inventory() -> dict:
-        return _process_entity("inventory")
+            # Within-entity dependencies: discover → validate → clean → load
+            discover = discover_files()
+            validate = validate_quarantine(discover)
+            clean = clean_files(discover)
+            load = load_files(discover)
+            discover >> validate >> clean >> load
+            
+            ingest_tasks[entity] = load
 
-    @task(task_id="ingest_revenue")
-    def ingest_revenue() -> dict:
-        return _process_entity("revenue")
+    # =========================================================================
+    # TRANSFORM STAGE: separate modules for dimensions, facts, aggregates
+    # =========================================================================
 
-    @task(task_id="ingest_returns")
-    def ingest_returns() -> dict:
-        return _process_entity("returns")
+    with TaskGroup(group_id="transform") as tg_transform:
+        
+        @task(task_id="bootstrap_analytics_schema")
+        def bootstrap_schema() -> str:
+            """Ensure all analytics tables and partitions exist."""
+            ensure_analytics_schema()
+            return "schema_ready"
 
-    @task(task_id="transform_to_analytics")
-    def transform_to_analytics(**kwargs) -> dict:
-        """
-        Run all staging -> analytics transforms after all entities are staged.
-        Runs SCD2 merges and fact table upserts.
-        """
-        results = run_all_transforms()
-        logger.info("Analytics transform complete: %s", results)
-        return results
+        @task(task_id="transform_dim_customers")
+        def xform_customers() -> dict:
+            """SCD2 merge: staging customers → analytics dim_customers."""
+            n = transform_dim_customers()
+            return {"table": "dim_customers", "rows": n}
 
-    # -- Define execution order --
-    # Dimensions must be loaded before facts that reference them.
-    # All ingestion tasks run in parallel, then analytics transform runs last.
-    customers_done  = ingest_customers()
-    products_done   = ingest_products()
-    orders_done     = ingest_orders()
-    payments_done   = ingest_payments()
-    inventory_done  = ingest_inventory()
-    revenue_done    = ingest_revenue()
-    returns_done    = ingest_returns()
+        @task(task_id="transform_dim_products")
+        def xform_products() -> dict:
+            """SCD2 merge: staging products → analytics dim_products."""
+            n = transform_dim_products()
+            return {"table": "dim_products", "rows": n}
 
-    [
-        customers_done,
-        products_done,
-        orders_done,
-        payments_done,
-        inventory_done,
-        revenue_done,
-        returns_done,
-    ] >> transform_to_analytics()
+        @task(task_id="transform_dim_inventory")
+        def xform_inventory() -> dict:
+            """Snapshot upsert: staging inventory → analytics dim_inventory."""
+            n = transform_dim_inventory()
+            return {"table": "dim_inventory", "rows": n}
+
+        @task(task_id="transform_fact_orders")
+        def xform_orders() -> dict:
+            """CDC-aware upsert: staging orders → analytics fact_orders (partitioned)."""
+            n = transform_fact_orders()
+            return {"table": "fact_orders", "rows": n}
+
+        @task(task_id="transform_fact_payments")
+        def xform_payments() -> dict:
+            """Upsert: staging payments → analytics fact_payments."""
+            n = transform_fact_payments()
+            return {"table": "fact_payments", "rows": n}
+
+        @task(task_id="transform_fact_returns")
+        def xform_returns() -> dict:
+            """Upsert: staging returns → analytics fact_returns."""
+            n = transform_fact_returns()
+            return {"table": "fact_returns", "rows": n}
+
+        @task(task_id="transform_agg_revenue")
+        def xform_revenue() -> dict:
+            """Delete-then-insert: staging revenue → analytics agg_revenue."""
+            n = transform_agg_revenue()
+            return {"table": "agg_revenue", "rows": n}
+
+        # Dependencies within transform stage
+        schema = bootstrap_schema()
+        
+        cust = xform_customers()
+        prod = xform_products()
+        inv = xform_inventory()
+        
+        schema >> [cust, prod, inv]
+        
+        orders = xform_orders()
+        [cust, prod, inv] >> orders
+        
+        payments = xform_payments()
+        revenue = xform_revenue()
+        orders >> [payments, revenue]
+        
+        returns = xform_returns()
+        orders >> returns
+
+    # =========================================================================
+    # POST-TRANSFORM QUALITY CHECKS
+    # =========================================================================
+
+    with TaskGroup(group_id="post_transform_quality") as tg_quality:
+
+        @task(task_id="cleanup_orphaned_fks")
+        def cleanup_fks() -> int:
+            """Null out orphaned FK references before constraint validation."""
+            return cleanup_orphaned_foreign_keys()
+
+        @task(task_id="validate_referential_integrity")
+        def validate_fks() -> int:
+            """Validate FK constraints (non-partitioned tables only due to Postgres limitation)."""
+            return validate_referential_constraints()
+
+        @task(task_id="check_default_partition")
+        def check_partition() -> int:
+            """Alert if fact_orders default partition has rows (out-of-range data)."""
+            return check_default_partition_usage()
+
+        @task(task_id="refresh_dashboard_views")
+        def refresh_views() -> int:
+            """Refresh materialized views for dashboard."""
+            return refresh_dashboard_materialized_views()
+
+        # Post-transform dependencies
+        cleanup = cleanup_fks()
+        validate = validate_fks()
+        partition = check_partition()
+        views = refresh_views()
+        
+        cleanup >> validate >> [partition, views]
+
+    # =========================================================================
+    # DAG Execution order
+    # =========================================================================
+    
+    # All ingest entities run in parallel, then transform tier runs, then quality checks.
+    all_ingest_list = list(ingest_tasks.values())
+    all_ingest_list >> tg_transform >> tg_quality
 
 
 ecommerce_pipeline()
